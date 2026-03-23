@@ -96,8 +96,8 @@ pub struct AttributeProto {
     pub f: ::core::option::Option<f32>,
     #[prost(int64, optional, tag = "3")]
     pub i: ::core::option::Option<i64>,
-    #[prost(string, optional, tag = "5")]
-    pub s: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub s: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(message, optional, tag = "6")]
     pub t: ::core::option::Option<TensorProto>,
     #[prost(float, repeated, tag = "7")]
@@ -126,8 +126,8 @@ pub struct ValueInfoProto {
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TypeProto {
-    #[prost(message, optional, tag = "1")]
-    pub tensor_type: ::core::option::Option<type_proto::Tensor>,
+    #[prost(oneof = "type_proto::Value", tags = "1")]
+    pub value: ::core::option::Option<type_proto::Value>,
 }
 
 pub mod type_proto {
@@ -137,6 +137,12 @@ pub mod type_proto {
         pub elem_type: ::core::option::Option<i32>,
         #[prost(message, optional, tag = "2")]
         pub shape: ::core::option::Option<super::TensorShapeProto>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        TensorType(Tensor),
     }
 }
 

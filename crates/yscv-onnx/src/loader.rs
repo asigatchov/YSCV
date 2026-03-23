@@ -245,7 +245,7 @@ fn convert_attribute(attr: &onnx::AttributeProto) -> Option<OnnxAttribute> {
         3 => {
             let s = attr
                 .s
-                .as_ref()
+                .as_deref()
                 .map(|b| String::from_utf8_lossy(b).to_string())
                 .unwrap_or_default();
             Some(OnnxAttribute::String(s))
