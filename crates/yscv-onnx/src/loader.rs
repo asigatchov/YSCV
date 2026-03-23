@@ -31,6 +31,7 @@ pub enum OnnxAttribute {
     String(String),
     Ints(Vec<i64>),
     Floats(Vec<f32>),
+    Tensor(Tensor),
 }
 
 /// Parsed ONNX model containing graph topology and weight tensors.
@@ -249,6 +250,11 @@ fn convert_attribute(attr: &onnx::AttributeProto) -> Option<OnnxAttribute> {
                 .map(|b| String::from_utf8_lossy(b).to_string())
                 .unwrap_or_default();
             Some(OnnxAttribute::String(s))
+        }
+        // TENSOR — used by Constant nodes to embed full tensor values
+        4 => {
+            let tp = attr.t.as_ref()?;
+            convert_tensor_proto(tp).ok().map(OnnxAttribute::Tensor)
         }
         6 => Some(OnnxAttribute::Floats(attr.floats.clone())),
         7 => Some(OnnxAttribute::Ints(attr.ints.clone())),

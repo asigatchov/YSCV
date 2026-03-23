@@ -1,7 +1,9 @@
 use super::*;
 
 pub(super) fn exec_constant(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
-    if let Some(OnnxAttribute::Float(v)) = node.attributes.get("value_float") {
+    if let Some(OnnxAttribute::Tensor(t)) = node.attributes.get("value") {
+        env.insert(node.outputs[0].clone(), t.clone());
+    } else if let Some(OnnxAttribute::Float(v)) = node.attributes.get("value_float") {
         env.insert(node.outputs[0].clone(), Tensor::scalar(*v));
     } else if let Some(OnnxAttribute::Int(v)) = node.attributes.get("value_int") {
         env.insert(node.outputs[0].clone(), Tensor::scalar(*v as f32));
