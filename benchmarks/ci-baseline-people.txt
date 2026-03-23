@@ -1,0 +1,16 @@
+# yscv CLI deterministic benchmark baseline thresholds (people detector)
+# Format: stage.metric=value
+# Supported stages: detect, track, recognize, end_to_end
+# Supported metrics: min_fps, max_mean_ms, max_p95_ms
+
+# Includes margin over observed local measurements to avoid CI flakes while
+# still detecting substantial regressions.
+detect.max_mean_ms=2
+detect.max_p95_ms=4
+track.max_mean_ms=2
+track.max_p95_ms=4
+recognize.max_mean_ms=2
+recognize.max_p95_ms=4
+end_to_end.max_mean_ms=5
+end_to_end.max_p95_ms=12
+end_to_end.min_fps=200

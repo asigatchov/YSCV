@@ -1,0 +1,29 @@
+[package]
+name = "yscv-tensor"
+description = "SIMD-accelerated tensor library with f32/f16/bf16 support and 80+ operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+rayon = "1.11"
+
+[features]
+mkl = []
+armpl = []
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "tensor_elementwise_modes"
+harness = false
+
+[lints]
+workspace = true

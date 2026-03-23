@@ -1,0 +1,10 @@
+# yscv-model criterion microbench baseline thresholds (upper bound, us)
+# Format: <benchmark>.max_upper_us=<value>
+# The checker uses the right value from criterion "time: [low mid high]" interval.
+# Thresholds based on GitHub Actions Ubuntu x86_64 runner.
+
+model_forward_modes/linear_64x32_batch32.max_upper_us=5
+model_forward_modes/linear_relu_linear_batch32.max_upper_us=12
+model_train_step_modes/sgd_step_batch16.max_upper_us=26
+model_train_step_modes/sgd_step_batch64.max_upper_us=44
+model_train_step_modes/sgd_step_batch16_hinge.max_upper_us=26

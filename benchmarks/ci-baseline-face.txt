@@ -1,0 +1,15 @@
+# yscv CLI deterministic benchmark baseline thresholds (face detector)
+# Format: stage.metric=value
+# Supported stages: detect, track, recognize, end_to_end
+# Supported metrics: min_fps, max_mean_ms, max_p95_ms
+
+# Face path is slightly heavier than people path; limits keep CI strict with margin.
+detect.max_mean_ms=3
+detect.max_p95_ms=6
+track.max_mean_ms=2
+track.max_p95_ms=4
+recognize.max_mean_ms=2
+recognize.max_p95_ms=4
+end_to_end.max_mean_ms=6
+end_to_end.max_p95_ms=15
+end_to_end.min_fps=180

@@ -1,0 +1,6 @@
+[
+  { "image_id": 0, "category_id": 0, "bbox": [0.0, 0.0, 2.0, 2.0], "score": 0.96 },
+  { "image_id": 1, "category_id": 0, "bbox": [2.1, 2.1, 2.0, 2.0], "score": 0.85 },
+  { "image_id": 2, "category_id": 0, "bbox": [4.0, 1.0, 2.0, 3.0], "score": 0.90 },
+  { "image_id": 1, "category_id": 0, "bbox": [6.0, 6.0, 1.0, 1.0], "score": 0.40 }
+]

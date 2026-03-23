@@ -1,0 +1,4 @@
+# image ids for VOC XML adapter
+frame0
+frame1
+frame2

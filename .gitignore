@@ -1,0 +1,43 @@
+target/
+artifacts/
+demo_output/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AI agent workspace
+.claude/worktrees/
+.claude/settings.local.json
+.claude/todos.json
+.claude/plans/
+
+# Python
+*.pyc
+__pycache__/
+.venv/
+venv/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.lib
+*.exe
+
+# Benchmark output (generated, not committed)
+criterion/
+
+# Misc
+*.log
+*.tmp
+.env

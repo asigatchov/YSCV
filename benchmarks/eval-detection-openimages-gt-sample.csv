@@ -1,0 +1,4 @@
+ImageID,LabelName,XMin,XMax,YMin,YMax
+frame0,/m/person,0.0,0.2,0.0,0.2
+frame1,/m/person,0.4,0.6,0.4,0.6
+frame2,/m/car,0.1,0.3,0.1,0.3

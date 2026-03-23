@@ -1,0 +1,434 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  workspace-compat:
+    name: Workspace Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc -y
+
+      - name: Install OpenBLAS (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Install OpenBLAS (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install openblas:x64-windows
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          echo "OPENBLAS_PATH=$vcpkg\lib" >> $env:GITHUB_ENV
+          echo "$vcpkg\bin" >> $env:GITHUB_PATH
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Test Workspace
+        run: cargo test --workspace --release
+
+      - name: GPU feature compilation check
+        if: runner.os == 'Linux'
+        run: cargo check -p yscv-kernels --features gpu
+
+  aarch64-linux:
+    name: ARM64 Linux (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc -y
+
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build & Test
+        run: cargo test --workspace
+
+      - name: Benchmark (u8 ops)
+        run: cargo run --release -p yscv-bench 2>&1 | grep "u8_"
+
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc -y
+
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test Workspace
+        run: cargo test
+
+      - name: Verify Camera Listing UX (No Native Feature)
+        run: |
+          cargo run -p yscv-cli --bin yscv-cli -- --list-cameras
+          cargo run -p yscv-cli --bin yscv-cli -- --list-cameras --device-name cam
+          cargo run -p camera-face-tool -- --list-cameras
+          cargo run -p camera-face-tool -- --list-cameras --device-name cam
+
+      - name: Verify Camera Diagnostics UX (No Native Feature)
+        run: |
+          mkdir -p artifacts
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --diagnose-camera --diagnose-frames 5 --diagnose-report artifacts/yscv-cli-diagnostics.json
+          cargo run -p camera-face-tool -- \
+            --diagnose-camera --diagnose-frames 5 --diagnose-report artifacts/camera-face-tool-diagnostics.json
+          test -s artifacts/yscv-cli-diagnostics.json
+          test -s artifacts/camera-face-tool-diagnostics.json
+
+      - name: Verify Event Log Output
+        run: |
+          mkdir -p artifacts
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --max-frames 3 \
+            --event-log artifacts/events.jsonl
+          test -s artifacts/events.jsonl
+
+      - name: Verify Dataset Eval Mode
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --eval-detection-jsonl benchmarks/eval-detection-sample.jsonl \
+            --eval-tracking-jsonl benchmarks/eval-tracking-sample.jsonl \
+            --eval-iou 0.5 \
+            --eval-score 0.0 \
+            2>&1 | tee artifacts/eval-dataset-output.txt
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --eval-detection-coco-gt benchmarks/eval-detection-coco-gt-sample.json \
+            --eval-detection-coco-pred benchmarks/eval-detection-coco-pred-sample.json \
+            --eval-iou 0.5 \
+            --eval-score 0.0 \
+            2>&1 | tee -a artifacts/eval-dataset-output.txt
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --eval-detection-openimages-gt benchmarks/eval-detection-openimages-gt-sample.csv \
+            --eval-detection-openimages-pred benchmarks/eval-detection-openimages-pred-sample.csv \
+            --eval-iou 0.5 \
+            --eval-score 0.0 \
+            2>&1 | tee -a artifacts/eval-dataset-output.txt
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --eval-detection-yolo-manifest benchmarks/eval-detection-yolo-manifest-sample.txt \
+            --eval-detection-yolo-gt-dir benchmarks/eval-detection-yolo-gt \
+            --eval-detection-yolo-pred-dir benchmarks/eval-detection-yolo-pred \
+            --eval-iou 0.5 \
+            --eval-score 0.0 \
+            2>&1 | tee -a artifacts/eval-dataset-output.txt
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --eval-detection-voc-manifest benchmarks/eval-detection-voc-manifest-sample.txt \
+            --eval-detection-voc-gt-dir benchmarks/eval-detection-voc-gt \
+            --eval-detection-voc-pred-dir benchmarks/eval-detection-voc-pred \
+            --eval-iou 0.5 \
+            --eval-score 0.0 \
+            2>&1 | tee -a artifacts/eval-dataset-output.txt
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --eval-detection-kitti-manifest benchmarks/eval-detection-kitti-manifest-sample.txt \
+            --eval-detection-kitti-gt-dir benchmarks/eval-detection-kitti-gt \
+            --eval-detection-kitti-pred-dir benchmarks/eval-detection-kitti-pred \
+            --eval-iou 0.5 \
+            --eval-score 0.0 \
+            2>&1 | tee -a artifacts/eval-dataset-output.txt
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --eval-detection-widerface-gt benchmarks/eval-detection-widerface-gt-sample.txt \
+            --eval-detection-widerface-pred benchmarks/eval-detection-widerface-pred-sample.txt \
+            --eval-iou 0.5 \
+            --eval-score 0.0 \
+            2>&1 | tee -a artifacts/eval-dataset-output.txt
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --eval-tracking-mot-gt benchmarks/eval-tracking-mot-gt-sample.txt \
+            --eval-tracking-mot-pred benchmarks/eval-tracking-mot-pred-sample.txt \
+            --eval-iou 0.5 \
+            --eval-score 0.0 \
+            2>&1 | tee -a artifacts/eval-dataset-output.txt
+          test -s artifacts/eval-dataset-output.txt
+
+      - name: Verify Diagnostics Report Validation Mode
+        run: |
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --validate-diagnostics-report benchmarks/diagnostics-sample-ok.json \
+            --validate-diagnostics-min-frames 2 \
+            --validate-diagnostics-max-drift-pct 25 \
+            --validate-diagnostics-max-dropped 0
+
+      - name: Run Deterministic Benchmark Gate
+        run: |
+          mkdir -p artifacts
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --benchmark \
+            --max-frames 3 \
+            --benchmark-report artifacts/benchmark.txt \
+            --benchmark-baseline benchmarks/ci-baseline-people.txt
+
+      - name: Run Deterministic Face Benchmark Gate
+        run: |
+          cargo run -p yscv-cli --bin yscv-cli -- \
+            --detect-target face \
+            --benchmark \
+            --max-frames 3 \
+            --benchmark-report artifacts/benchmark-face.txt \
+            --benchmark-baseline benchmarks/ci-baseline-face.txt
+
+      - name: Export Runtime Trend Snapshot
+        run: |
+          bash benchmarks/export-runtime-trend.sh \
+            artifacts/benchmark-runtime-trend.tsv \
+            artifacts/benchmark.txt \
+            artifacts/benchmark-face.txt \
+            artifacts/eval-dataset-output.txt
+
+      - name: Compare Runtime Trend Snapshot
+        env:
+          RUSTCV_TREND_MAX_REGRESSION_PCT_RUNTIME: ${{ vars.RUSTCV_TREND_MAX_REGRESSION_PCT_RUNTIME }}
+        run: |
+          bash benchmarks/compare-trend-snapshots.sh \
+            runtime \
+            benchmarks/trend-baseline-runtime.tsv \
+            artifacts/benchmark-runtime-trend.tsv \
+            artifacts/benchmark-runtime-trend-diff.tsv
+
+      - name: Run Detect Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-detect \
+            detect_heatmap_scratch \
+            artifacts/benchmark-detect-micro.txt \
+            benchmarks/ci-baseline-detect-micro.txt
+
+      - name: Run Track Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-track \
+            tracker_update \
+            artifacts/benchmark-track-micro.txt \
+            benchmarks/ci-baseline-track-micro.txt
+
+      - name: Run Recognize Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-recognize \
+            recognize_slice_vs_tensor \
+            artifacts/benchmark-recognize-micro.txt \
+            benchmarks/ci-baseline-recognize-micro.txt
+
+      - name: Run Video Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-video \
+            normalize_rgb8 \
+            artifacts/benchmark-video-micro.txt \
+            benchmarks/ci-baseline-video-micro.txt
+
+      - name: Run Tensor Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-tensor \
+            tensor_elementwise_modes \
+            artifacts/benchmark-tensor-micro.txt \
+            benchmarks/ci-baseline-tensor-micro.txt
+
+      - name: Run Kernels Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-kernels \
+            kernels_cpu_ops \
+            artifacts/benchmark-kernels-micro.txt \
+            benchmarks/ci-baseline-kernels-micro.txt
+
+      - name: Run Model Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-model \
+            model_runtime_ops \
+            artifacts/benchmark-model-micro.txt \
+            benchmarks/ci-baseline-model-micro.txt
+
+      - name: Run Imgproc Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-imgproc \
+            imgproc_ops \
+            artifacts/benchmark-imgproc-micro.txt \
+            benchmarks/ci-baseline-imgproc-micro.txt
+
+      - name: Run Autograd Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-autograd \
+            autograd_graph_ops \
+            artifacts/benchmark-autograd-micro.txt \
+            benchmarks/ci-baseline-autograd-micro.txt
+
+      - name: Run Eval Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-eval \
+            eval_metrics_ops \
+            artifacts/benchmark-eval-micro.txt \
+            benchmarks/ci-baseline-eval-micro.txt
+
+      - name: Run CLI Runtime Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            yscv-cli \
+            cli_runtime_ops \
+            artifacts/benchmark-cli-micro.txt \
+            benchmarks/ci-baseline-cli-micro.txt
+
+      - name: Run Camera Face Tool Runtime Microbench Gate
+        run: |
+          bash benchmarks/run-criterion-gate.sh \
+            camera-face-tool \
+            camera_face_runtime_ops \
+            artifacts/benchmark-camera-face-tool-micro.txt \
+            benchmarks/ci-baseline-camera-face-tool-micro.txt
+
+      - name: Export Microbench Trend Snapshot
+        run: |
+          bash benchmarks/export-criterion-trend.sh \
+            artifacts/benchmark-micro-trend.tsv \
+            artifacts/benchmark-detect-micro.txt \
+            artifacts/benchmark-track-micro.txt \
+            artifacts/benchmark-recognize-micro.txt \
+            artifacts/benchmark-video-micro.txt \
+            artifacts/benchmark-tensor-micro.txt \
+            artifacts/benchmark-kernels-micro.txt \
+            artifacts/benchmark-model-micro.txt \
+            artifacts/benchmark-imgproc-micro.txt \
+            artifacts/benchmark-autograd-micro.txt \
+            artifacts/benchmark-eval-micro.txt \
+            artifacts/benchmark-cli-micro.txt \
+            artifacts/benchmark-camera-face-tool-micro.txt
+
+      - name: Compare Microbench Trend Snapshot
+        env:
+          RUSTCV_TREND_MAX_REGRESSION_PCT_MICRO: ${{ vars.RUSTCV_TREND_MAX_REGRESSION_PCT_MICRO }}
+        run: |
+          bash benchmarks/compare-trend-snapshots.sh \
+            micro \
+            benchmarks/trend-baseline-micro.tsv \
+            artifacts/benchmark-micro-trend.tsv \
+            artifacts/benchmark-micro-trend-diff.tsv
+
+      - name: Check Trend Baseline Freshness
+        env:
+          RUSTCV_TREND_BASELINE_MAX_AGE_DAYS: ${{ vars.RUSTCV_TREND_BASELINE_MAX_AGE_DAYS }}
+          RUSTCV_TREND_BASELINE_ENFORCE: ${{ vars.RUSTCV_TREND_BASELINE_ENFORCE }}
+        run: |
+          bash benchmarks/check-trend-baseline-freshness.sh \
+            benchmarks/trend-baseline-micro.tsv \
+            "${RUSTCV_TREND_BASELINE_MAX_AGE_DAYS:-14}"
+          bash benchmarks/check-trend-baseline-freshness.sh \
+            benchmarks/trend-baseline-runtime.tsv \
+            "${RUSTCV_TREND_BASELINE_MAX_AGE_DAYS:-14}"
+
+      - name: Upload Benchmark Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yscv-benchmark-reports
+          path: |
+            artifacts/*.txt
+            artifacts/*.tsv
+            artifacts/*.json
+            artifacts/*.jsonl
+
+  miri:
+    name: Miri (unsafe soundness)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Nightly + Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Miri — yscv-tensor
+        run: cargo +nightly miri test -p yscv-tensor --lib
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
+
+      - name: Miri — yscv-kernels (no GPU)
+        run: cargo +nightly miri test -p yscv-kernels --lib
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
+
+      # yscv-autograd skipped: uses rayon (via yscv-kernels) which triggers
+      # a known crossbeam-epoch Stacked Borrows violation under Miri.
+      # See: https://github.com/crossbeam-rs/crossbeam/issues/545
+

@@ -1,0 +1,6 @@
+# yscv-cli criterion microbench baseline thresholds (upper bound, us)
+# Format: <benchmark>.max_upper_us=<value>
+# The checker uses the right value from criterion "time: [low mid high]" interval.
+
+cli_runtime_modes/people_detect_track_recognize_rgb8_160x120.max_upper_us=200
+cli_runtime_modes/face_detect_track_recognize_rgb8_160x120.max_upper_us=470

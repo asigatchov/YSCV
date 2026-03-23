@@ -1,0 +1,15 @@
+{
+  "images": [
+    { "id": 0, "file_name": "frame-0.jpg", "width": 8, "height": 8 },
+    { "id": 1, "file_name": "frame-1.jpg", "width": 8, "height": 8 },
+    { "id": 2, "file_name": "frame-2.jpg", "width": 8, "height": 8 }
+  ],
+  "categories": [
+    { "id": 0, "name": "person" }
+  ],
+  "annotations": [
+    { "id": 1, "image_id": 0, "category_id": 0, "bbox": [0.0, 0.0, 2.0, 2.0] },
+    { "id": 2, "image_id": 1, "category_id": 0, "bbox": [2.0, 2.0, 2.0, 2.0] },
+    { "id": 3, "image_id": 2, "category_id": 0, "bbox": [4.0, 1.0, 2.0, 3.0] }
+  ]
+}

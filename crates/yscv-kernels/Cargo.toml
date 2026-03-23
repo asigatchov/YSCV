@@ -1,0 +1,36 @@
+[package]
+name = "yscv-kernels"
+description = "CPU and GPU compute backends with SIMD dispatch and BLAS integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[features]
+default = ["blas"]
+blas = []
+mkl = []
+armpl = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+pollster = { version = "0.4", optional = true }
+rayon = "1.11"
+yscv-tensor = { version = "0.1.0", path = "../yscv-tensor" }
+thiserror.workspace = true
+wgpu = { version = "24", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "kernels_cpu_ops"
+harness = false
+
+[lints]
+workspace = true

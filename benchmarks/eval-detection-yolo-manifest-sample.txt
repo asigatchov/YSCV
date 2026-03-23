@@ -1,0 +1,4 @@
+# image_id width height
+frame0 8 8
+frame1 8 8
+frame2 8 8

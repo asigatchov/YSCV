@@ -1,0 +1,7 @@
+# yscv-recognize criterion microbench baseline thresholds (upper bound, us)
+# Format: <benchmark>.max_upper_us=<value>
+# The checker uses the right value from criterion "time: [low mid high]" interval.
+
+recognize_query_modes/slice_stack_embedding.max_upper_us=1.5
+recognize_query_modes/tensor_reused.max_upper_us=1.5
+recognize_query_modes/tensor_alloc_per_call.max_upper_us=1.5

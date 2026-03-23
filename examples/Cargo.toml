@@ -1,0 +1,46 @@
+[package]
+name = "yscv-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+yscv-tensor = { path = "../crates/yscv-tensor" }
+yscv-autograd = { path = "../crates/yscv-autograd" }
+yscv-model = { path = "../crates/yscv-model" }
+yscv-imgproc = { path = "../crates/yscv-imgproc" }
+yscv-detect = { path = "../crates/yscv-detect" }
+yscv-eval = { path = "../crates/yscv-eval" }
+yscv-video = { path = "../crates/yscv-video" }
+yscv-track = { path = "../crates/yscv-track" }
+yscv-optim = { path = "../crates/yscv-optim" }
+yscv-kernels = { path = "../crates/yscv-kernels" }
+thiserror.workspace = true
+
+[[example]]
+name = "classify_image"
+path = "src/classify_image.rs"
+
+[[example]]
+name = "train_linear"
+path = "src/train_linear.rs"
+
+[[example]]
+name = "detect_objects"
+path = "src/detect_objects.rs"
+
+[[example]]
+name = "image_processing"
+path = "src/image_processing.rs"
+
+[[example]]
+name = "train_cnn"
+path = "src/train_cnn.rs"
+
+[[example]]
+name = "image_pipeline"
+path = "src/image_pipeline.rs"
+
+[lints]
+workspace = true

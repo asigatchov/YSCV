@@ -1,0 +1,30 @@
+[package]
+name = "yscv-eval"
+description = "Evaluation metrics (mAP, MOTA, HOTA) and dataset adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+yscv-detect = { version = "0.1.0", path = "../yscv-detect" }
+yscv-track = { version = "0.1.0", path = "../yscv-track" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+roxmltree = "0.20"
+csv = "1.3"
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "eval_metrics_ops"
+harness = false
+
+[lints]
+workspace = true

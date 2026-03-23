@@ -1,0 +1,6 @@
+# yscv-track criterion microbench baseline thresholds (upper bound, us)
+# Format: <benchmark>.max_upper_us=<value>
+# The checker uses the right value from criterion "time: [low mid high]" interval.
+
+tracker_update_modes/update_alloc_output.max_upper_us=1100
+tracker_update_modes/update_into_reused_output.max_upper_us=1100

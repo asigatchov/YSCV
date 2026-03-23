@@ -1,0 +1,50 @@
+{
+  "tool": "yscv-cli",
+  "mode": "diagnostics",
+  "status": "ok",
+  "requested": {
+    "device_index": 0,
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "diagnose_frames": 60,
+    "device_name_query": null
+  },
+  "discovered_devices": [
+    {
+      "index": 0,
+      "label": "Camera"
+    }
+  ],
+  "selected_device": {
+    "index": 0,
+    "label": "Camera"
+  },
+  "capture": {
+    "requested_frames": 60,
+    "collected_frames": 60,
+    "wall_ms": 2000.0,
+    "first_frame": {
+      "index": 0,
+      "timestamp_us": 1000,
+      "shape": [
+        480,
+        640,
+        3
+      ]
+    },
+    "timing": {
+      "target_fps": 30.0,
+      "wall_fps": 29.8,
+      "sensor_fps": 29.7,
+      "wall_drift_pct": -0.7,
+      "sensor_drift_pct": -1.0,
+      "mean_gap_us": 33670.0,
+      "min_gap_us": 32000,
+      "max_gap_us": 35000,
+      "dropped_frames": 0,
+      "drift_warning": false,
+      "dropped_frames_warning": false
+    }
+  }
+}

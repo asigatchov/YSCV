@@ -1,0 +1,8 @@
+# yscv-tensor criterion microbench baseline thresholds (upper bound, us)
+# Format: <benchmark>.max_upper_us=<value>
+# The checker uses the right value from criterion "time: [low mid high]" interval.
+
+tensor_add_modes/same_shape_fast_path.max_upper_us=292
+tensor_add_modes/broadcast_path.max_upper_us=712
+tensor_mul_modes/same_shape_fast_path.max_upper_us=250
+tensor_mul_modes/broadcast_path.max_upper_us=658

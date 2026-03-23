@@ -1,0 +1,790 @@
+use yscv_tensor::Tensor;
+
+use super::super::ImgProcError;
+use super::super::shape::hwc_shape;
+
+/// A contour as an ordered list of (x, y) boundary pixel coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Contour {
+    pub points: Vec<(usize, usize)>,
+}
+
+/// Finds external contours in a binary single-channel `[H, W, 1]` image.
+///
+/// Pixels > 0.5 are foreground. Returns a list of contours where each contour
+/// is an ordered sequence of border pixel coordinates using 8-connected
+/// Moore boundary tracing.
+pub fn find_contours(input: &Tensor) -> Result<Vec<Contour>, ImgProcError> {
+    let (h, w, c) = hwc_shape(input)?;
+    if c != 1 {
+        return Err(ImgProcError::InvalidChannelCount {
+            expected: 1,
+            got: c,
+        });
+    }
+    let data = input.data();
+    let mut visited = vec![false; h * w];
+    let mut contours = Vec::new();
+
+    // 8-connected Moore neighborhood (clockwise from east)
+    const DIRS: [(i32, i32); 8] = [
+        (1, 0),
+        (1, 1),
+        (0, 1),
+        (-1, 1),
+        (-1, 0),
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+    ];
+
+    for y in 0..h {
+        for x in 0..w {
+            if data[y * w + x] <= 0.5 || visited[y * w + x] {
+                continue;
+            }
+            // Check if this is a border pixel (has at least one background 4-neighbor)
+            let is_border = x == 0
+                || x == w - 1
+                || y == 0
+                || y == h - 1
+                || data[y * w + x - 1] <= 0.5
+                || data[y * w + x + 1] <= 0.5
+                || data[(y - 1) * w + x] <= 0.5
+                || data[(y + 1) * w + x] <= 0.5;
+            if !is_border {
+                continue;
+            }
+
+            // Moore boundary trace
+            let mut contour_points = Vec::new();
+            let start = (x, y);
+            let mut cur = start;
+            let mut dir = 0usize; // start looking east
+            let max_steps = h * w * 2;
+            let mut steps = 0;
+
+            loop {
+                contour_points.push(cur);
+                visited[cur.1 * w + cur.0] = true;
+
+                let mut found = false;
+                let start_dir = (dir + 5) % 8; // backtrack: turn right from where we came
+                for i in 0..8 {
+                    let d = (start_dir + i) % 8;
+                    let (dx, dy) = DIRS[d];
+                    let nx = cur.0 as i32 + dx;
+                    let ny = cur.1 as i32 + dy;
+                    if nx >= 0 && nx < w as i32 && ny >= 0 && ny < h as i32 {
+                        let (ux, uy) = (nx as usize, ny as usize);
+                        if data[uy * w + ux] > 0.5 {
+                            cur = (ux, uy);
+                            dir = d;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !found || cur == start || steps > max_steps {
+                    break;
+                }
+                steps += 1;
+            }
+
+            if contour_points.len() >= 2 {
+                contours.push(Contour {
+                    points: contour_points,
+                });
+            }
+        }
+    }
+
+    Ok(contours)
+}
+
+/// Computes the convex hull of 2D points using Andrew's monotone chain algorithm.
+///
+/// Input points are `(x, y)` pairs. Returns hull vertices in counter-clockwise order.
+pub fn convex_hull(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+
+    let mut pts: Vec<(f32, f32)> = points.to_vec();
+    pts.sort_unstable_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let n = pts.len();
+    let mut hull: Vec<(f32, f32)> = Vec::with_capacity(2 * n);
+
+    for &p in &pts {
+        while hull.len() >= 2 && cross_2d(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+
+    let lower_len = hull.len() + 1;
+    for &p in pts.iter().rev().skip(1) {
+        while hull.len() >= lower_len
+            && cross_2d(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+        {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    hull.pop();
+    hull
+}
+
+fn cross_2d(o: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+}
+
+/// Computes the minimum-area bounding rectangle for a set of 2D points
+/// using the rotating calipers approach on the convex hull.
+///
+/// Returns `(center_x, center_y, width, height, angle_radians)`.
+pub fn min_area_rect(points: &[(f32, f32)]) -> Option<(f32, f32, f32, f32, f32)> {
+    let hull = convex_hull(points);
+    if hull.len() < 2 {
+        return hull.first().map(|p| (p.0, p.1, 0.0, 0.0, 0.0));
+    }
+
+    let n = hull.len();
+    let mut best_area = f32::MAX;
+    let mut best_rect = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let edge_x = hull[j].0 - hull[i].0;
+        let edge_y = hull[j].1 - hull[i].1;
+        let edge_len = (edge_x * edge_x + edge_y * edge_y).sqrt();
+        if edge_len < 1e-12 {
+            continue;
+        }
+        let ux = edge_x / edge_len;
+        let uy = edge_y / edge_len;
+
+        let mut min_proj = f32::MAX;
+        let mut max_proj = f32::MIN;
+        let mut min_perp = f32::MAX;
+        let mut max_perp = f32::MIN;
+
+        for &p in &hull {
+            let dx = p.0 - hull[i].0;
+            let dy = p.1 - hull[i].1;
+            let proj = dx * ux + dy * uy;
+            let perp = -dx * uy + dy * ux;
+            min_proj = min_proj.min(proj);
+            max_proj = max_proj.max(proj);
+            min_perp = min_perp.min(perp);
+            max_perp = max_perp.max(perp);
+        }
+
+        let width = max_proj - min_proj;
+        let height = max_perp - min_perp;
+        let area = width * height;
+        if area < best_area {
+            best_area = area;
+            let mid_proj = (min_proj + max_proj) * 0.5;
+            let mid_perp = (min_perp + max_perp) * 0.5;
+            let cx = hull[i].0 + ux * mid_proj - uy * mid_perp;
+            let cy = hull[i].1 + uy * mid_proj + ux * mid_perp;
+            let angle = uy.atan2(ux);
+            best_rect = (cx, cy, width, height, angle);
+        }
+    }
+
+    Some(best_rect)
+}
+
+/// Computes a 3x3 homography matrix from 4 source/destination point correspondences
+/// using the Direct Linear Transform (DLT) algorithm.
+///
+/// `src` and `dst` must each contain exactly 4 points `(x, y)`.
+/// Returns the 9-element matrix in row-major order.
+pub fn homography_4pt(
+    src: &[(f32, f32); 4],
+    dst: &[(f32, f32); 4],
+) -> Result<[f32; 9], ImgProcError> {
+    let mut a = [[0.0f64; 8]; 8];
+    let mut b = [0.0f64; 8];
+
+    for i in 0..4 {
+        let (sx, sy) = (src[i].0 as f64, src[i].1 as f64);
+        let (dx, dy) = (dst[i].0 as f64, dst[i].1 as f64);
+        let r = i * 2;
+        a[r] = [sx, sy, 1.0, 0.0, 0.0, 0.0, -dx * sx, -dx * sy];
+        b[r] = dx;
+        a[r + 1] = [0.0, 0.0, 0.0, sx, sy, 1.0, -dy * sx, -dy * sy];
+        b[r + 1] = dy;
+    }
+
+    let h =
+        solve_8x8(&a, &b).ok_or(ImgProcError::InvalidOutputDimensions { out_h: 0, out_w: 0 })?;
+
+    Ok([
+        h[0] as f32,
+        h[1] as f32,
+        h[2] as f32,
+        h[3] as f32,
+        h[4] as f32,
+        h[5] as f32,
+        h[6] as f32,
+        h[7] as f32,
+        1.0,
+    ])
+}
+
+#[allow(clippy::needless_range_loop)]
+fn solve_8x8(a: &[[f64; 8]; 8], b: &[f64; 8]) -> Option<[f64; 8]> {
+    let mut m = [[0.0f64; 9]; 8];
+    for i in 0..8 {
+        for j in 0..8 {
+            m[i][j] = a[i][j];
+        }
+        m[i][8] = b[i];
+    }
+
+    for col in 0..8 {
+        let mut pivot = col;
+        let mut max_val = m[col][col].abs();
+        for row in (col + 1)..8 {
+            if m[row][col].abs() > max_val {
+                max_val = m[row][col].abs();
+                pivot = row;
+            }
+        }
+        if max_val < 1e-12 {
+            return None;
+        }
+        if pivot != col {
+            m.swap(pivot, col);
+        }
+        let diag = m[col][col];
+        for j in col..9 {
+            m[col][j] /= diag;
+        }
+        for row in 0..8 {
+            if row != col {
+                let factor = m[row][col];
+                for j in col..9 {
+                    m[row][j] -= factor * m[col][j];
+                }
+            }
+        }
+    }
+
+    let mut result = [0.0f64; 8];
+    for i in 0..8 {
+        result[i] = m[i][8];
+    }
+    Some(result)
+}
+
+/// RANSAC-based homography estimation from point correspondences.
+///
+/// Iteratively samples 4-point subsets, computes candidate homographies via DLT,
+/// and selects the model with the most inliers under `inlier_threshold`.
+/// Returns `(homography [9], inlier_mask)`.
+pub fn ransac_homography(
+    src: &[(f32, f32)],
+    dst: &[(f32, f32)],
+    iterations: usize,
+    inlier_threshold: f32,
+    rng_seed: u64,
+) -> Option<([f32; 9], Vec<bool>)> {
+    if src.len() < 4 || src.len() != dst.len() {
+        return None;
+    }
+    let n = src.len();
+    let mut best_h = [0.0f32; 9];
+    let mut best_inliers: Vec<bool> = vec![false; n];
+    let mut best_count = 0usize;
+    let mut rng_state = rng_seed;
+
+    for _ in 0..iterations {
+        let mut indices = [0usize; 4];
+        for slot in &mut indices {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *slot = (rng_state >> 33) as usize % n;
+        }
+        let src4: [(f32, f32); 4] = [
+            src[indices[0]],
+            src[indices[1]],
+            src[indices[2]],
+            src[indices[3]],
+        ];
+        let dst4: [(f32, f32); 4] = [
+            dst[indices[0]],
+            dst[indices[1]],
+            dst[indices[2]],
+            dst[indices[3]],
+        ];
+        let h = match homography_4pt(&src4, &dst4) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        let mut inliers = vec![false; n];
+        let mut count = 0;
+        for i in 0..n {
+            let (sx, sy) = src[i];
+            let denom = h[6] * sx + h[7] * sy + h[8];
+            if denom.abs() < 1e-12 {
+                continue;
+            }
+            let px = (h[0] * sx + h[1] * sy + h[2]) / denom;
+            let py = (h[3] * sx + h[4] * sy + h[5]) / denom;
+            let err = ((px - dst[i].0).powi(2) + (py - dst[i].1).powi(2)).sqrt();
+            if err < inlier_threshold {
+                inliers[i] = true;
+                count += 1;
+            }
+        }
+        if count > best_count {
+            best_count = count;
+            best_h = h;
+            best_inliers = inliers;
+        }
+    }
+
+    if best_count >= 4 {
+        Some((best_h, best_inliers))
+    } else {
+        None
+    }
+}
+
+/// Fits an axis-aligned ellipse to a set of 2D points using the method of moments.
+///
+/// Returns `(center_x, center_y, semi_axis_a, semi_axis_b, rotation_angle_radians)`.
+pub fn fit_ellipse(points: &[(f32, f32)]) -> Option<(f32, f32, f32, f32, f32)> {
+    if points.len() < 5 {
+        return None;
+    }
+    let n = points.len() as f32;
+    let cx: f32 = points.iter().map(|p| p.0).sum::<f32>() / n;
+    let cy: f32 = points.iter().map(|p| p.1).sum::<f32>() / n;
+
+    let mut cov_xx = 0.0f32;
+    let mut cov_xy = 0.0f32;
+    let mut cov_yy = 0.0f32;
+    for &(x, y) in points {
+        let dx = x - cx;
+        let dy = y - cy;
+        cov_xx += dx * dx;
+        cov_xy += dx * dy;
+        cov_yy += dy * dy;
+    }
+    cov_xx /= n;
+    cov_xy /= n;
+    cov_yy /= n;
+
+    let trace = cov_xx + cov_yy;
+    let det = cov_xx * cov_yy - cov_xy * cov_xy;
+    let disc = (trace * trace / 4.0 - det).max(0.0).sqrt();
+    let lambda1 = trace / 2.0 + disc;
+    let lambda2 = (trace / 2.0 - disc).max(1e-12);
+
+    let angle = cov_xy.atan2(lambda1 - cov_yy);
+    let a = (2.0 * lambda1).sqrt();
+    let b = (2.0 * lambda2).sqrt();
+
+    Some((cx, cy, a, b, angle))
+}
+
+/// Douglas-Peucker contour approximation.
+///
+/// Simplifies a polyline by recursively removing points within `epsilon` distance
+/// from the line segment connecting endpoints.
+pub fn approx_poly_dp(contour: &[(f32, f32)], epsilon: f32) -> Vec<(f32, f32)> {
+    if contour.len() <= 2 {
+        return contour.to_vec();
+    }
+    let n = contour.len();
+    let (first, last) = (contour[0], contour[n - 1]);
+
+    let mut max_dist = 0.0f32;
+    let mut max_idx = 0;
+    for (i, &pt) in contour.iter().enumerate().skip(1).take(n - 2) {
+        let d = point_line_dist_f32(pt, first, last);
+        if d > max_dist {
+            max_dist = d;
+            max_idx = i;
+        }
+    }
+
+    if max_dist > epsilon {
+        let mut left = approx_poly_dp(&contour[..=max_idx], epsilon);
+        let right = approx_poly_dp(&contour[max_idx..], epsilon);
+        left.pop();
+        left.extend(right);
+        left
+    } else {
+        vec![first, last]
+    }
+}
+
+/// Statistics for a single connected component.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentStats {
+    pub label: usize,
+    pub area: usize,
+    pub bbox: (usize, usize, usize, usize), // (x, y, w, h)
+    pub centroid: (f32, f32),               // (cx, cy)
+}
+
+/// Properties for a labelled region.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionProp {
+    pub label: usize,
+    pub area: usize,
+    pub centroid: (f32, f32),
+    pub bbox: (usize, usize, usize, usize), // (x, y, w, h)
+    pub perimeter: f32,
+}
+
+/// Connected-component labelling with per-component statistics.
+///
+/// Input: single-channel binary image `[H, W, 1]` (pixels > 0.5 are foreground).
+/// Returns `(label_image, stats)` where `label_image` has shape `[H, W, 1]` with
+/// label 0 for background and labels 1..N for components. Uses BFS with 4-connectivity.
+pub fn connected_components_with_stats(
+    img: &Tensor,
+) -> Result<(Tensor, Vec<ComponentStats>), ImgProcError> {
+    let (h, w, c) = hwc_shape(img)?;
+    if c != 1 {
+        return Err(ImgProcError::InvalidChannelCount {
+            expected: 1,
+            got: c,
+        });
+    }
+    let data = img.data();
+    let mut labels = vec![0u32; h * w];
+    let mut next_label = 1u32;
+    let mut stats_list: Vec<ComponentStats> = Vec::new();
+
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            if data[idx] <= 0.5 || labels[idx] != 0 {
+                continue;
+            }
+            // BFS flood-fill
+            let current_label = next_label;
+            next_label += 1;
+            labels[idx] = current_label;
+
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back((x, y));
+
+            let mut area = 0usize;
+            let mut sum_x = 0.0f64;
+            let mut sum_y = 0.0f64;
+            let mut min_x = x;
+            let mut max_x = x;
+            let mut min_y = y;
+            let mut max_y = y;
+
+            while let Some((cx, cy)) = queue.pop_front() {
+                area += 1;
+                sum_x += cx as f64;
+                sum_y += cy as f64;
+                if cx < min_x {
+                    min_x = cx;
+                }
+                if cx > max_x {
+                    max_x = cx;
+                }
+                if cy < min_y {
+                    min_y = cy;
+                }
+                if cy > max_y {
+                    max_y = cy;
+                }
+
+                for &(dx, dy) in &[(0isize, -1isize), (0, 1), (-1, 0), (1, 0)] {
+                    let nx = cx as isize + dx;
+                    let ny = cy as isize + dy;
+                    if nx >= 0 && nx < w as isize && ny >= 0 && ny < h as isize {
+                        let nidx = ny as usize * w + nx as usize;
+                        if data[nidx] > 0.5 && labels[nidx] == 0 {
+                            labels[nidx] = current_label;
+                            queue.push_back((nx as usize, ny as usize));
+                        }
+                    }
+                }
+            }
+
+            stats_list.push(ComponentStats {
+                label: current_label as usize,
+                area,
+                bbox: (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1),
+                centroid: ((sum_x / area as f64) as f32, (sum_y / area as f64) as f32),
+            });
+        }
+    }
+
+    let label_data: Vec<f32> = labels.iter().map(|&l| l as f32).collect();
+    let label_tensor = Tensor::from_vec(vec![h, w, 1], label_data)?;
+    Ok((label_tensor, stats_list))
+}
+
+/// Compute region properties from a label image.
+///
+/// Input: label image `[H, W, 1]` (e.g. from `connected_components_with_stats`).
+/// For each non-zero label, computes area, centroid, bounding box, and perimeter.
+/// Perimeter counts pixels that are adjacent to a different label or to the image edge.
+pub fn region_props(labels: &Tensor) -> Result<Vec<RegionProp>, ImgProcError> {
+    let (h, w, c) = hwc_shape(labels)?;
+    if c != 1 {
+        return Err(ImgProcError::InvalidChannelCount {
+            expected: 1,
+            got: c,
+        });
+    }
+    let data = labels.data();
+
+    // Find all unique non-zero labels
+    let mut max_label = 0u32;
+    for &v in data.iter() {
+        let l = v as u32;
+        if l > max_label {
+            max_label = l;
+        }
+    }
+    if max_label == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Accumulators per label (1-indexed, slot 0 unused)
+    let n = max_label as usize;
+    let mut area = vec![0usize; n + 1];
+    let mut sum_x = vec![0.0f64; n + 1];
+    let mut sum_y = vec![0.0f64; n + 1];
+    let mut min_x = vec![usize::MAX; n + 1];
+    let mut max_x = vec![0usize; n + 1];
+    let mut min_y = vec![usize::MAX; n + 1];
+    let mut max_y = vec![0usize; n + 1];
+    let mut perim = vec![0usize; n + 1];
+
+    for y in 0..h {
+        for x in 0..w {
+            let l = data[y * w + x] as u32;
+            if l == 0 {
+                continue;
+            }
+            let li = l as usize;
+            area[li] += 1;
+            sum_x[li] += x as f64;
+            sum_y[li] += y as f64;
+            if x < min_x[li] {
+                min_x[li] = x;
+            }
+            if x > max_x[li] {
+                max_x[li] = x;
+            }
+            if y < min_y[li] {
+                min_y[li] = y;
+            }
+            if y > max_y[li] {
+                max_y[li] = y;
+            }
+
+            // Boundary pixel: adjacent to a different label or at the image edge
+            let is_boundary = x == 0
+                || x == w - 1
+                || y == 0
+                || y == h - 1
+                || data[y * w + (x - 1)] as u32 != l
+                || data[y * w + (x + 1)] as u32 != l
+                || data[(y - 1) * w + x] as u32 != l
+                || data[(y + 1) * w + x] as u32 != l;
+            if is_boundary {
+                perim[li] += 1;
+            }
+        }
+    }
+
+    let mut props = Vec::new();
+    for li in 1..=n {
+        if area[li] == 0 {
+            continue;
+        }
+        props.push(RegionProp {
+            label: li,
+            area: area[li],
+            centroid: (
+                (sum_x[li] / area[li] as f64) as f32,
+                (sum_y[li] / area[li] as f64) as f32,
+            ),
+            bbox: (
+                min_x[li],
+                min_y[li],
+                max_x[li] - min_x[li] + 1,
+                max_y[li] - min_y[li] + 1,
+            ),
+            perimeter: perim[li] as f32,
+        });
+    }
+
+    Ok(props)
+}
+
+/// Computes the 7 Hu invariant moments from a single-channel `[H, W, 1]` image.
+///
+/// Hu moments are invariant to translation, scale, and rotation. They are
+/// derived from the normalised central moments of the image.
+pub fn hu_moments(img: &Tensor) -> Result<[f64; 7], ImgProcError> {
+    let (h, w, c) = hwc_shape(img)?;
+    if c != 1 {
+        return Err(ImgProcError::InvalidChannelCount {
+            expected: 1,
+            got: c,
+        });
+    }
+    let data = img.data();
+
+    // Raw moments m00, m10, m01
+    let mut m00 = 0.0f64;
+    let mut m10 = 0.0f64;
+    let mut m01 = 0.0f64;
+    for y in 0..h {
+        for x in 0..w {
+            let v = data[y * w + x] as f64;
+            m00 += v;
+            m10 += x as f64 * v;
+            m01 += y as f64 * v;
+        }
+    }
+    if m00.abs() < 1e-15 {
+        return Ok([0.0; 7]);
+    }
+    let cx = m10 / m00;
+    let cy = m01 / m00;
+
+    // Central moments up to order 3
+    let mut mu20 = 0.0f64;
+    let mut mu02 = 0.0f64;
+    let mut mu11 = 0.0f64;
+    let mut mu30 = 0.0f64;
+    let mut mu03 = 0.0f64;
+    let mut mu21 = 0.0f64;
+    let mut mu12 = 0.0f64;
+    for y in 0..h {
+        for x in 0..w {
+            let v = data[y * w + x] as f64;
+            let dx = x as f64 - cx;
+            let dy = y as f64 - cy;
+            mu20 += dx * dx * v;
+            mu02 += dy * dy * v;
+            mu11 += dx * dy * v;
+            mu30 += dx * dx * dx * v;
+            mu03 += dy * dy * dy * v;
+            mu21 += dx * dx * dy * v;
+            mu12 += dx * dy * dy * v;
+        }
+    }
+
+    // Normalised central moments: eta_pq = mu_pq / m00^((p+q)/2 + 1)
+    let n20 = mu20 / m00.powf(2.0);
+    let n02 = mu02 / m00.powf(2.0);
+    let n11 = mu11 / m00.powf(2.0);
+    let n30 = mu30 / m00.powf(2.5);
+    let n03 = mu03 / m00.powf(2.5);
+    let n21 = mu21 / m00.powf(2.5);
+    let n12 = mu12 / m00.powf(2.5);
+
+    // Hu's 7 invariants
+    let h1 = n20 + n02;
+    let h2 = (n20 - n02).powi(2) + 4.0 * n11 * n11;
+    let h3 = (n30 - 3.0 * n12).powi(2) + (3.0 * n21 - n03).powi(2);
+    let h4 = (n30 + n12).powi(2) + (n21 + n03).powi(2);
+    let h5 = (n30 - 3.0 * n12) * (n30 + n12) * ((n30 + n12).powi(2) - 3.0 * (n21 + n03).powi(2))
+        + (3.0 * n21 - n03) * (n21 + n03) * (3.0 * (n30 + n12).powi(2) - (n21 + n03).powi(2));
+    let h6 = (n20 - n02) * ((n30 + n12).powi(2) - (n21 + n03).powi(2))
+        + 4.0 * n11 * (n30 + n12) * (n21 + n03);
+    let h7 = (3.0 * n21 - n03) * (n30 + n12) * ((n30 + n12).powi(2) - 3.0 * (n21 + n03).powi(2))
+        - (n30 - 3.0 * n12) * (n21 + n03) * (3.0 * (n30 + n12).powi(2) - (n21 + n03).powi(2));
+
+    Ok([h1, h2, h3, h4, h5, h6, h7])
+}
+
+fn point_line_dist_f32(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-12 {
+        return ((p.0 - a.0).powi(2) + (p.1 - a.1).powi(2)).sqrt();
+    }
+    let cross = ((p.0 - a.0) * dy - (p.1 - a.1) * dx).abs();
+    cross / len_sq.sqrt()
+}
+
+/// Computes the area of a polygon defined by its vertices using the Shoelace formula.
+///
+/// The contour should be an ordered sequence of `(x, y)` vertex coordinates.
+/// Returns the absolute area of the polygon.
+pub fn contour_area(contour: &[(usize, usize)]) -> f64 {
+    if contour.len() < 3 {
+        return 0.0;
+    }
+    let n = contour.len();
+    let mut sum = 0.0f64;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (x1, y1) = (contour[i].0 as f64, contour[i].1 as f64);
+        let (x2, y2) = (contour[j].0 as f64, contour[j].1 as f64);
+        sum += x1 * y2 - x2 * y1;
+    }
+    sum.abs() / 2.0
+}
+
+/// Computes the perimeter (arc length) of a contour.
+///
+/// Sums the Euclidean distances between consecutive points.
+/// If `closed` is true, also adds the distance from the last point back to the first.
+pub fn arc_length(contour: &[(usize, usize)], closed: bool) -> f64 {
+    if contour.len() < 2 {
+        return 0.0;
+    }
+    let mut length = 0.0f64;
+    for i in 0..contour.len() - 1 {
+        let dx = contour[i + 1].0 as f64 - contour[i].0 as f64;
+        let dy = contour[i + 1].1 as f64 - contour[i].1 as f64;
+        length += (dx * dx + dy * dy).sqrt();
+    }
+    if closed {
+        let dx = contour[0].0 as f64 - contour[contour.len() - 1].0 as f64;
+        let dy = contour[0].1 as f64 - contour[contour.len() - 1].1 as f64;
+        length += (dx * dx + dy * dy).sqrt();
+    }
+    length
+}
+
+/// Computes the axis-aligned bounding rectangle of a contour.
+///
+/// Returns `(x, y, width, height)` where `(x, y)` is the top-left corner.
+pub fn bounding_rect(contour: &[(usize, usize)]) -> (usize, usize, usize, usize) {
+    if contour.is_empty() {
+        return (0, 0, 0, 0);
+    }
+    let mut min_x = usize::MAX;
+    let mut min_y = usize::MAX;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    for &(x, y) in contour {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    (min_x, min_y, max_x - min_x, max_y - min_y)
+}

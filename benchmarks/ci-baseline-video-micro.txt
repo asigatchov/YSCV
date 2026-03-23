@@ -1,0 +1,6 @@
+# yscv-video criterion microbench baseline thresholds (upper bound, us)
+# Format: <benchmark>.max_upper_us=<value>
+# The checker uses the right value from criterion "time: [low mid high]" interval.
+
+video_normalize_rgb8_modes/normalize_alloc_output.max_upper_us=1800
+video_normalize_rgb8_modes/normalize_reused_output.max_upper_us=1000

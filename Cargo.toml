@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/bench",
+    "apps/camera-face-tool",
+    "crates/yscv-tensor",
+    "crates/yscv-autograd",
+    "crates/yscv-optim",
+    "crates/yscv-kernels",
+    "crates/yscv-model",
+    "crates/yscv-imgproc",
+    "crates/yscv-video",
+    "crates/yscv-detect",
+    "crates/yscv-recognize",
+    "crates/yscv-track",
+    "crates/yscv-eval",
+    "crates/yscv-cli",
+    "crates/yscv-onnx",
+    "crates/yscv",
+    "examples",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+authors = ["yscv contributors"]
+rust-version = "1.92"
+description = "Pure Rust computer vision and deep learning framework — image processing, neural network training, ONNX inference, object detection, tracking, and recognition in a single binary"
+repository = "https://github.com/nickstienz/yscv"
+categories = ["computer-vision", "science", "algorithms", "multimedia"]
+keywords = ["tensor", "simd", "deep-learning", "image-processing", "neon"]
+
+[workspace.dependencies]
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+new_without_default = "allow"
+if_same_then_else = "allow"
+should_implement_trait = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

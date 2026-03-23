@@ -1,0 +1,2 @@
+{"ground_truth":[{"bbox":{"x1":0.0,"y1":0.0,"x2":2.0,"y2":2.0},"class_id":0}],"predictions":[{"bbox":{"x1":0.0,"y1":0.0,"x2":2.0,"y2":2.0},"score":0.9,"class_id":0}]}
+{"ground_truth":[{"bbox":{"x1":3.0,"y1":3.0,"x2":5.0,"y2":5.0},"class_id":0}],"predictions":[{"bbox":{"x1":3.0,"y1":3.0,"x2":5.0,"y2":5.0},"score":0.85,"class_id":0},{"bbox":{"x1":10.0,"y1":10.0,"x2":12.0,"y2":12.0},"score":0.7,"class_id":0}]}

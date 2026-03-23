@@ -1,0 +1,26 @@
+[package]
+name = "yscv-onnx"
+description = "ONNX runtime with 128+ operators, quantization, and graph optimization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+prost = "0.13"
+yscv-kernels = { version = "0.1.0", path = "../yscv-kernels" }
+yscv-tensor = { version = "0.1.0", path = "../yscv-tensor" }
+thiserror.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

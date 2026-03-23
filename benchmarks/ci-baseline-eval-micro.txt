@@ -1,0 +1,9 @@
+# Criterion microbench regression guard for yscv-eval.
+# Units: microseconds (upper bound from criterion "time: [low mid high]").
+
+eval_detection_modes/evaluate_detections_view_120f.max_upper_us=286
+eval_detection_modes/evaluate_detections_dataset_120f.max_upper_us=480
+eval_tracking_modes/evaluate_tracking_view_120f.max_upper_us=124
+eval_tracking_modes/evaluate_tracking_dataset_120f.max_upper_us=220
+eval_pipeline_modes/summarize_pipeline_durations_512f.max_upper_us=58
+eval_pipeline_modes/validate_pipeline_thresholds_512f.max_upper_us=2

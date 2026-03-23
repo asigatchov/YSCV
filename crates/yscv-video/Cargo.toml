@@ -1,0 +1,32 @@
+[package]
+name = "yscv-video"
+description = "Video decoding (H.264, HEVC), MP4 parsing, and camera I/O"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[features]
+default = []
+native-camera = ["dep:nokhwa"]
+
+[dependencies]
+bytes = "1"
+nokhwa = { version = "0.10.10", optional = true, default-features = false, features = ["input-native"] }
+rayon = "1.11"
+yscv-tensor = { version = "0.1.0", path = "../yscv-tensor" }
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "normalize_rgb8"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+# yscv CLI deterministic benchmark baseline thresholds (legacy shared profile)
+# Prefer target-specific baselines for CI:
+# - benchmarks/ci-baseline-people.txt
+# - benchmarks/ci-baseline-face.txt
+# Format: stage.metric=value
+# Supported stages: detect, track, recognize, end_to_end
+# Supported metrics: min_fps, max_mean_ms, max_p95_ms
+
+detect.max_mean_ms=10
+detect.max_p95_ms=20
+track.max_mean_ms=10
+recognize.max_mean_ms=10
+end_to_end.max_mean_ms=30
+end_to_end.max_p95_ms=60
+end_to_end.min_fps=20

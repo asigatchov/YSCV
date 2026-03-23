@@ -1,0 +1,12 @@
+# yscv-detect criterion microbench baseline thresholds (upper bound, us)
+# Format: <benchmark>.max_upper_us=<value>
+# The checker uses the right value from criterion "time: [low mid high]" interval.
+
+detect_heatmap_modes/fresh_internal_buffers.max_upper_us=130
+detect_heatmap_modes/reused_scratch_buffers.max_upper_us=130
+detect_people_rgb8_modes/fresh_internal_scratch.max_upper_us=178
+detect_people_rgb8_modes/reused_external_scratch.max_upper_us=172
+detect_people_frame_modes/fresh_internal_scratch.max_upper_us=360
+detect_people_frame_modes/reused_external_scratch.max_upper_us=320
+detect_faces_frame_modes/fresh_internal_scratch.max_upper_us=484
+detect_faces_frame_modes/reused_external_scratch.max_upper_us=468
