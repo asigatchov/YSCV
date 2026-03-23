@@ -35,7 +35,6 @@ const REDUCE_SUM_BACKWARD_WGSL: &str = include_str!("shaders/reduce_sum_backward
 
 // ── Pipeline cache ─────────────────────────────────────────────────
 
-#[allow(dead_code)]
 struct Pipelines {
     matmul: wgpu::ComputePipeline,
     elementwise: wgpu::ComputePipeline,
@@ -360,7 +359,6 @@ impl GpuBackend {
     // ── Internal device-resident dispatch helpers ─────────────────
 
     /// Elementwise op entirely on device buffers, returning a device buffer.
-    #[allow(dead_code)]
     fn gpu_elementwise_on_device(
         &self,
         a: &wgpu::Buffer,
@@ -408,7 +406,6 @@ impl GpuBackend {
     }
 
     /// Unary op entirely on device buffers, returning a device buffer.
-    #[allow(dead_code)]
     fn gpu_unary_on_device(&self, a: &wgpu::Buffer, len: usize, op: u32) -> wgpu::Buffer {
         let buf_out = self.output_buf(len);
         let params: [u32; 2] = [len as u32, op];
