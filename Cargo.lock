@@ -2566,6 +2566,7 @@ dependencies = [
  "yscv-imgproc",
  "yscv-kernels",
  "yscv-model",
+ "yscv-onnx",
  "yscv-optim",
  "yscv-tensor",
  "yscv-track",

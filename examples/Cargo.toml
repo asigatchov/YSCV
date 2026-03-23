@@ -16,6 +16,7 @@ yscv-video = { path = "../crates/yscv-video" }
 yscv-track = { path = "../crates/yscv-track" }
 yscv-optim = { path = "../crates/yscv-optim" }
 yscv-kernels = { path = "../crates/yscv-kernels" }
+yscv-onnx = { path = "../crates/yscv-onnx" }
 thiserror.workspace = true
 
 [[example]]
@@ -41,6 +42,14 @@ path = "src/train_cnn.rs"
 [[example]]
 name = "image_pipeline"
 path = "src/image_pipeline.rs"
+
+[[example]]
+name = "yolo_detect"
+path = "src/yolo_detect.rs"
+
+[[example]]
+name = "yolo_finetune"
+path = "src/yolo_finetune.rs"
 
 [lints]
 workspace = true
