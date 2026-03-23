@@ -116,13 +116,13 @@ The framework is split into 14 crates, each doing one thing well:
 | Crate | Purpose |
 |-------|---------|
 | `yscv-tensor` | N-dimensional tensor with 115 ops, f32/f16/bf16, SIMD-accelerated |
-| `yscv-kernels` | CPU + GPU compute backends, 295 SIMD functions, 17 GPU shaders |
+| `yscv-kernels` | CPU + GPU compute backends, 295 SIMD functions, 20 GPU shaders |
 | `yscv-autograd` | Reverse-mode autodiff with 40+ backward ops |
 | `yscv-optim` | SGD, Adam, AdamW, LAMB, RAdam — all with SIMD. 11 LR schedulers |
 | `yscv-model` | 39 layer types, Trainer API, model zoo, LoRA, distributed training |
 | `yscv-imgproc` | 178 image processing ops (blur, edges, morphology, features, color) |
 | `yscv-video` | H.264/HEVC decoder, camera I/O, MP4 parsing |
-| `yscv-detect` | YOLOv8 pipeline, NMS, heatmap decoding |
+| `yscv-detect` | YOLOv8/v11 pipeline, NMS, heatmap decoding |
 | `yscv-track` | DeepSORT, ByteTrack, Kalman filter |
 | `yscv-recognize` | Cosine matching, VP-Tree ANN indexing |
 | `yscv-eval` | 41 metrics (mAP, MOTA, HOTA, PSNR, etc.), 11 dataset formats |

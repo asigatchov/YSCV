@@ -9,7 +9,7 @@ yscv is a monorepo Cargo workspace with 14 library crates, 2 application binarie
 ```
 yscv (umbrella re-export)
 ├── yscv-tensor          ← 115 ops, f32/f16/bf16, 50 SIMD functions
-├── yscv-kernels         ← 61 kernel ops, 49 SIMD, 17 GPU WGSL shaders
+├── yscv-kernels         ← 61 kernel ops, 49 SIMD, 20 GPU WGSL shaders
 ├── yscv-autograd        ← dynamic computation graph, 40+ backward ops
 ├── yscv-optim           ← 20 optimizers, 11 LR schedulers
 ├── yscv-model           ← 39 layer types, 13 model zoo architectures, 17 losses

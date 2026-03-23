@@ -10,7 +10,7 @@ The crates form a layered architecture. Lower layers know nothing about higher l
 `yscv-tensor` provides the `Tensor` type with 115+ operations, f32/f16/bf16 dtype support, operator overloading (`+`, `-`, `*`, `/`), `Display` impl, and SIMD-accelerated reductions. Everything else depends on this.
 
 **Layer 1 — Compute:**
-`yscv-kernels` provides the `Backend` trait with 50+ methods (conv2d, matmul, pool, normalization, activation, backward ops). It has a `CpuBackend` with rayon parallelism and SIMD dispatch, a `ThreadedCpuBackend`, and an optional `GpuBackend` using wgpu compute shaders (17 WGSL shaders including backward kernels). The SIMD code lives in `crates/yscv-kernels/src/ops/simd.rs` (3000+ lines) with AVX, SSE, and NEON implementations for every kernel.
+`yscv-kernels` provides the `Backend` trait with 50+ methods (conv2d, matmul, pool, normalization, activation, backward ops). It has a `CpuBackend` with rayon parallelism and SIMD dispatch, a `ThreadedCpuBackend`, and an optional `GpuBackend` using wgpu compute shaders (20 WGSL shaders including backward kernels). The SIMD code lives in `crates/yscv-kernels/src/ops/simd.rs` (3000+ lines) with AVX, SSE, and NEON implementations for every kernel.
 
 **Layer 2 — Autograd and Optimization:**
 `yscv-autograd` builds on kernels to provide a dynamic computation graph with tape-based reverse-mode autodiff. `yscv-optim` provides optimizers and schedulers.

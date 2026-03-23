@@ -10,510 +10,32 @@ use crate::{
 
 const MIN_GPU_ELEMENTS: usize = 4096;
 
-// ── WGSL Shaders ───────────────────────────────────────────────────
+// ── WGSL Shaders (loaded from external files) ────────────────────
 
-const MATMUL_WGSL: &str = r#"
-struct Params { m: u32, n: u32, k: u32, _pad: u32 }
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> p: Params;
-const T: u32 = 16u;
-var<workgroup> ta: array<f32, 256>;
-var<workgroup> tb: array<f32, 256>;
-@compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = gid.y; let col = gid.x;
-    var sum = 0.0;
-    let tiles = (p.k + T - 1u) / T;
-    for (var t = 0u; t < tiles; t++) {
-        let ac = t * T + lid.x;
-        if (row < p.m && ac < p.k) { ta[lid.y * T + lid.x] = a[row * p.k + ac]; }
-        else { ta[lid.y * T + lid.x] = 0.0; }
-        let br = t * T + lid.y;
-        if (br < p.k && col < p.n) { tb[lid.y * T + lid.x] = b[br * p.n + col]; }
-        else { tb[lid.y * T + lid.x] = 0.0; }
-        workgroupBarrier();
-        for (var i = 0u; i < T; i++) { sum += ta[lid.y * T + i] * tb[i * T + lid.x]; }
-        workgroupBarrier();
-    }
-    if (row < p.m && col < p.n) { out[row * p.n + col] = sum; }
-}
-"#;
-
-const ELEMENTWISE_WGSL: &str = r#"
-struct Params { len: u32, op: u32 }
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= p.len) { return; }
-    switch p.op {
-        case 0u: { out[i] = a[i] + b[i]; }
-        case 1u: { out[i] = a[i] - b[i]; }
-        case 2u: { out[i] = a[i] * b[i]; }
-        default: {}
-    }
-}
-"#;
-
-const UNARY_WGSL: &str = r#"
-struct Params { len: u32, op: u32 }
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= p.len) { return; }
-    switch p.op {
-        case 0u: { out[i] = max(a[i], 0.0); }
-        case 1u: { out[i] = 1.0 / (1.0 + exp(-a[i])); }
-        case 2u: { out[i] = exp(a[i]); }
-        case 3u: { out[i] = tanh(a[i]); }
-        default: {}
-    }
-}
-"#;
-
-const SOFTMAX_WGSL: &str = r#"
-struct Params { rows: u32, cols: u32 }
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= p.rows) { return; }
-    let base = row * p.cols;
-    var mx = inp[base];
-    for (var j = 1u; j < p.cols; j++) { mx = max(mx, inp[base + j]); }
-    var s = 0.0;
-    for (var j = 0u; j < p.cols; j++) {
-        let e = exp(inp[base + j] - mx);
-        out[base + j] = e;
-        s += e;
-    }
-    for (var j = 0u; j < p.cols; j++) { out[base + j] /= s; }
-}
-"#;
-
-const LOG_SOFTMAX_WGSL: &str = r#"
-struct Params { rows: u32, cols: u32 }
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= p.rows) { return; }
-    let base = row * p.cols;
-    var mx = inp[base];
-    for (var j = 1u; j < p.cols; j++) { mx = max(mx, inp[base + j]); }
-    var s = 0.0;
-    for (var j = 0u; j < p.cols; j++) { s += exp(inp[base + j] - mx); }
-    let lse = mx + log(s);
-    for (var j = 0u; j < p.cols; j++) { out[base + j] = inp[base + j] - lse; }
-}
-"#;
-
-const LOGSUMEXP_WGSL: &str = r#"
-struct Params { rows: u32, cols: u32 }
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= p.rows) { return; }
-    let base = row * p.cols;
-    var mx = inp[base];
-    for (var j = 1u; j < p.cols; j++) { mx = max(mx, inp[base + j]); }
-    var s = 0.0;
-    for (var j = 0u; j < p.cols; j++) { s += exp(inp[base + j] - mx); }
-    out[row] = mx + log(s);
-}
-"#;
-
-const CONV2D_WGSL: &str = r#"
-struct Params {
-    n: u32, ih: u32, iw: u32, ic: u32,
-    oc: u32, kh: u32, kw: u32,
-    sh: u32, sw: u32, oh: u32, ow: u32, _pad: u32,
-}
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read> kern: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let ow_idx = gid.x; let oh_idx = gid.y;
-    let batch_oc = gid.z;
-    let batch = batch_oc / p.oc;
-    let co = batch_oc % p.oc;
-    if (oh_idx >= p.oh || ow_idx >= p.ow || batch >= p.n) { return; }
-    var sum = bias[co];
-    for (var ky = 0u; ky < p.kh; ky++) {
-        for (var kx = 0u; kx < p.kw; kx++) {
-            let iy = oh_idx * p.sh + ky;
-            let ix = ow_idx * p.sw + kx;
-            for (var ci = 0u; ci < p.ic; ci++) {
-                let in_val = inp[((batch * p.ih + iy) * p.iw + ix) * p.ic + ci];
-                let k_val = kern[((ky * p.kw + kx) * p.ic + ci) * p.oc + co];
-                sum += in_val * k_val;
-            }
-        }
-    }
-    out[((batch * p.oh + oh_idx) * p.ow + ow_idx) * p.oc + co] = sum;
-}
-"#;
-
-const POOL2D_WGSL: &str = r#"
-struct Params {
-    n: u32, ih: u32, iw: u32, c: u32,
-    kh: u32, kw: u32, sh: u32, sw: u32,
-    oh: u32, ow: u32, mode: u32, _pad: u32,
-}
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let ow_idx = gid.x; let oh_idx = gid.y;
-    let batch_c = gid.z;
-    let batch = batch_c / p.c;
-    let ch = batch_c % p.c;
-    if (oh_idx >= p.oh || ow_idx >= p.ow || batch >= p.n) { return; }
-    var val: f32;
-    if (p.mode == 0u) { val = -1e38; } else { val = 0.0; }
-    var cnt = 0.0;
-    for (var ky = 0u; ky < p.kh; ky++) {
-        for (var kx = 0u; kx < p.kw; kx++) {
-            let iy = oh_idx * p.sh + ky;
-            let ix = ow_idx * p.sw + kx;
-            let v = inp[((batch * p.ih + iy) * p.iw + ix) * p.c + ch];
-            if (p.mode == 0u) { val = max(val, v); }
-            else { val += v; cnt += 1.0; }
-        }
-    }
-    if (p.mode == 1u && cnt > 0.0) { val /= cnt; }
-    out[((batch * p.oh + oh_idx) * p.ow + ow_idx) * p.c + ch] = val;
-}
-"#;
-
-const BATCH_NORM_WGSL: &str = r#"
-struct Params { total: u32, c: u32, eps: f32, _pad: u32 }
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read> gamma: array<f32>;
-@group(0) @binding(2) var<storage, read> beta: array<f32>;
-@group(0) @binding(3) var<storage, read> mean: array<f32>;
-@group(0) @binding(4) var<storage, read> variance: array<f32>;
-@group(0) @binding(5) var<storage, read_write> out: array<f32>;
-@group(0) @binding(6) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= p.total) { return; }
-    let ch = i % p.c;
-    let inv_std = 1.0 / sqrt(variance[ch] + p.eps);
-    out[i] = gamma[ch] * (inp[i] - mean[ch]) * inv_std + beta[ch];
-}
-"#;
-
-const LAYER_NORM_WGSL: &str = r#"
-struct Params { rows: u32, cols: u32, eps: f32, _pad: u32 }
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read> gamma: array<f32>;
-@group(0) @binding(2) var<storage, read> beta: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= p.rows) { return; }
-    let base = row * p.cols;
-    var mu = 0.0;
-    for (var j = 0u; j < p.cols; j++) { mu += inp[base + j]; }
-    mu /= f32(p.cols);
-    var v = 0.0;
-    for (var j = 0u; j < p.cols; j++) { let d = inp[base + j] - mu; v += d * d; }
-    v /= f32(p.cols);
-    let inv = 1.0 / sqrt(v + p.eps);
-    for (var j = 0u; j < p.cols; j++) {
-        out[base + j] = gamma[j] * (inp[base + j] - mu) * inv + beta[j];
-    }
-}
-"#;
-
-const DEPTHWISE_CONV2D_WGSL: &str = r#"
-struct Params {
-    n: u32, ih: u32, iw: u32, c: u32,
-    dm: u32, kh: u32, kw: u32,
-    sh: u32, sw: u32, oh: u32, ow: u32, _pad: u32,
-}
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read> kern: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let ow_idx = gid.x; let oh_idx = gid.y;
-    let batch_cdm = gid.z;
-    let oc = p.c * p.dm;
-    let batch = batch_cdm / oc;
-    let cdm = batch_cdm % oc;
-    let ch = cdm / p.dm;
-    let dm_idx = cdm % p.dm;
-    if (oh_idx >= p.oh || ow_idx >= p.ow || batch >= p.n) { return; }
-    var sum = bias[cdm];
-    for (var ky = 0u; ky < p.kh; ky++) {
-        for (var kx = 0u; kx < p.kw; kx++) {
-            let iy = oh_idx * p.sh + ky;
-            let ix = ow_idx * p.sw + kx;
-            let in_val = inp[((batch * p.ih + iy) * p.iw + ix) * p.c + ch];
-            let k_val = kern[((ky * p.kw + kx) * p.c + ch) * p.dm + dm_idx];
-            sum += in_val * k_val;
-        }
-    }
-    out[((batch * p.oh + oh_idx) * p.ow + ow_idx) * oc + cdm] = sum;
-}
-"#;
-
-const TRANSPOSE_CONV2D_WGSL: &str = r#"
-struct Params {
-    n: u32, ih: u32, iw: u32, ic: u32,
-    oc: u32, kh: u32, kw: u32,
-    sh: u32, sw: u32, oh: u32, ow: u32, _pad: u32,
-}
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read> kern: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let ow_idx = gid.x; let oh_idx = gid.y;
-    let batch_co = gid.z;
-    let batch = batch_co / p.oc;
-    let co = batch_co % p.oc;
-    if (oh_idx >= p.oh || ow_idx >= p.ow || batch >= p.n) { return; }
-    var sum = bias[co];
-    for (var ky = 0u; ky < p.kh; ky++) {
-        for (var kx = 0u; kx < p.kw; kx++) {
-            let in_y_f = i32(oh_idx) - i32(ky);
-            let in_x_f = i32(ow_idx) - i32(kx);
-            if (in_y_f < 0 || in_x_f < 0) { continue; }
-            let in_y = u32(in_y_f);
-            let in_x = u32(in_x_f);
-            if (in_y % p.sh != 0u || in_x % p.sw != 0u) { continue; }
-            let iy = in_y / p.sh;
-            let ix = in_x / p.sw;
-            if (iy >= p.ih || ix >= p.iw) { continue; }
-            for (var ci = 0u; ci < p.ic; ci++) {
-                let in_val = inp[((batch * p.ih + iy) * p.iw + ix) * p.ic + ci];
-                let k_val = kern[((ky * p.kw + kx) * p.ic + ci) * p.oc + co];
-                sum += in_val * k_val;
-            }
-        }
-    }
-    out[((batch * p.oh + oh_idx) * p.ow + ow_idx) * p.oc + co] = sum;
-}
-"#;
-
-const TRANSPOSE_2D_WGSL: &str = r#"
-struct Params { rows: u32, cols: u32 }
-@group(0) @binding(0) var<storage, read> inp: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.y;
-    let col = gid.x;
-    if (row >= p.rows || col >= p.cols) { return; }
-    out[col * p.rows + row] = inp[row * p.cols + col];
-}
-"#;
-
-const GATHER_WGSL: &str = r#"
-struct Params { len: u32, _pad: u32 }
-@group(0) @binding(0) var<storage, read> data: array<f32>;
-@group(0) @binding(1) var<storage, read> indices: array<u32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= p.len) { return; }
-    out[i] = data[indices[i]];
-}
-"#;
-
-const ATTENTION_WGSL: &str = r#"
-struct Params { seq_q: u32, seq_k: u32, d_k: u32, d_v: u32, scale: f32, _pad1: u32, _pad2: u32, _pad3: u32 }
-@group(0) @binding(0) var<storage, read> q: array<f32>;
-@group(0) @binding(1) var<storage, read> k: array<f32>;
-@group(0) @binding(2) var<storage, read> v: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-@compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let qi = gid.y;
-    let vi = gid.x;
-    if (qi >= p.seq_q || vi >= p.d_v) { return; }
-    var sum = 0.0;
-    for (var ki = 0u; ki < p.seq_k; ki++) {
-        var dot = 0.0;
-        for (var d = 0u; d < p.d_k; d++) {
-            dot += q[qi * p.d_k + d] * k[ki * p.d_k + d];
-        }
-        let score = dot * p.scale;
-        // Simplified: no softmax in this kernel (applied separately)
-        sum += score * v[ki * p.d_v + vi];
-    }
-    out[qi * p.d_v + vi] = sum;
-}
-"#;
-
-const GROUP_NORM_WGSL: &str = r#"
-struct Params { n: u32, c: u32, spatial: u32, groups: u32, eps: f32, _pad1: u32, _pad2: u32, _pad3: u32 }
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> gamma: array<f32>;
-@group(0) @binding(2) var<storage, read> beta: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let total = p.n * p.c * p.spatial;
-    if (idx >= total) { return; }
-    let s = idx % p.spatial;
-    let c = (idx / p.spatial) % p.c;
-    let n_idx = idx / (p.c * p.spatial);
-    let g = c / (p.c / p.groups);
-    let g_size = (p.c / p.groups) * p.spatial;
-    let g_start = n_idx * p.c * p.spatial + g * g_size;
-    var mean = 0.0;
-    for (var i = 0u; i < g_size; i++) { mean += input[g_start + i]; }
-    mean /= f32(g_size);
-    var variance = 0.0;
-    for (var i = 0u; i < g_size; i++) {
-        let d = input[g_start + i] - mean;
-        variance += d * d;
-    }
-    variance /= f32(g_size);
-    let inv_std = 1.0 / sqrt(variance + p.eps);
-    out[idx] = (input[idx] - mean) * inv_std * gamma[c] + beta[c];
-}
-"#;
-
-const RMS_NORM_WGSL: &str = r#"
-struct Params { rows: u32, cols: u32, eps: f32, _pad: u32 }
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> gamma: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= p.rows) { return; }
-    let base = row * p.cols;
-    var sq_sum = 0.0;
-    for (var c = 0u; c < p.cols; c++) { sq_sum += input[base + c] * input[base + c]; }
-    let rms = sqrt(sq_sum / f32(p.cols) + p.eps);
-    let inv_rms = 1.0 / rms;
-    for (var c = 0u; c < p.cols; c++) { out[base + c] = input[base + c] * inv_rms * gamma[c]; }
-}
-"#;
-
-const BACKWARD_BINARY_WGSL: &str = r#"
-struct Params { len: u32, op: u32 }
-@group(0) @binding(0) var<storage, read> upstream: array<f32>;
-@group(0) @binding(1) var<storage, read> forward_val: array<f32>;
-@group(0) @binding(2) var<storage, read_write> grad_out: array<f32>;
-@group(0) @binding(3) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= p.len) { return; }
-    switch p.op {
-        // relu_backward: upstream * (forward_input > 0 ? 1 : 0)
-        case 0u: { grad_out[i] = upstream[i] * select(0.0, 1.0, forward_val[i] > 0.0); }
-        // sigmoid_backward: upstream * s * (1 - s)  where s = forward_output
-        case 1u: {
-            let s = forward_val[i];
-            grad_out[i] = upstream[i] * s * (1.0 - s);
-        }
-        // tanh_backward: upstream * (1 - t*t)  where t = forward_output
-        case 2u: {
-            let t = forward_val[i];
-            grad_out[i] = upstream[i] * (1.0 - t * t);
-        }
-        // exp_backward: upstream * e  where e = forward_output
-        case 3u: { grad_out[i] = upstream[i] * forward_val[i]; }
-        default: {}
-    }
-}
-"#;
-
-const CONV2D_INPUT_GRAD_WGSL: &str = r#"
-struct Params {
-    n: u32, ih: u32, iw: u32, ic: u32,
-    oc: u32, kh: u32, kw: u32,
-    sh: u32, sw: u32, oh: u32, ow: u32, _pad: u32,
-}
-@group(0) @binding(0) var<storage, read> upstream: array<f32>;
-@group(0) @binding(1) var<storage, read> kern: array<f32>;
-@group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
-@group(0) @binding(3) var<uniform> p: Params;
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let iw_idx = gid.x; let ih_idx = gid.y;
-    let batch_ic = gid.z;
-    let batch = batch_ic / p.ic;
-    let ci = batch_ic % p.ic;
-    if (ih_idx >= p.ih || iw_idx >= p.iw || batch >= p.n) { return; }
-    var sum = 0.0;
-    for (var ky = 0u; ky < p.kh; ky++) {
-        for (var kx = 0u; kx < p.kw; kx++) {
-            let oy_check = ih_idx - ky;
-            let ox_check = iw_idx - kx;
-            // Check that the subtraction didn't underflow (unsigned) and alignment.
-            if (ih_idx < ky || iw_idx < kx) { continue; }
-            if (oy_check % p.sh != 0u || ox_check % p.sw != 0u) { continue; }
-            let oy = oy_check / p.sh;
-            let ox = ox_check / p.sw;
-            if (oy >= p.oh || ox >= p.ow) { continue; }
-            for (var co = 0u; co < p.oc; co++) {
-                let g = upstream[((batch * p.oh + oy) * p.ow + ox) * p.oc + co];
-                let k_val = kern[((ky * p.kw + kx) * p.ic + ci) * p.oc + co];
-                sum += g * k_val;
-            }
-        }
-    }
-    grad_input[((batch * p.ih + ih_idx) * p.iw + iw_idx) * p.ic + ci] = sum;
-}
-"#;
-
-const REDUCE_SUM_BACKWARD_WGSL: &str = r#"
-struct Params { len: u32, _pad: u32 }
-@group(0) @binding(0) var<storage, read> upstream: array<f32>;
-@group(0) @binding(1) var<storage, read_write> grad_out: array<f32>;
-@group(0) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= p.len) { return; }
-    grad_out[i] = upstream[0];
-}
-"#;
+const MATMUL_WGSL: &str = include_str!("shaders/matmul.wgsl");
+const ELEMENTWISE_WGSL: &str = include_str!("shaders/elementwise.wgsl");
+const UNARY_WGSL: &str = include_str!("shaders/unary.wgsl");
+const SOFTMAX_WGSL: &str = include_str!("shaders/softmax.wgsl");
+const LOG_SOFTMAX_WGSL: &str = include_str!("shaders/log_softmax.wgsl");
+const LOGSUMEXP_WGSL: &str = include_str!("shaders/logsumexp.wgsl");
+const CONV2D_WGSL: &str = include_str!("shaders/conv2d.wgsl");
+const POOL2D_WGSL: &str = include_str!("shaders/pool2d.wgsl");
+const BATCH_NORM_WGSL: &str = include_str!("shaders/batch_norm.wgsl");
+const LAYER_NORM_WGSL: &str = include_str!("shaders/layer_norm.wgsl");
+const DEPTHWISE_CONV2D_WGSL: &str = include_str!("shaders/depthwise_conv2d.wgsl");
+const TRANSPOSE_CONV2D_WGSL: &str = include_str!("shaders/transpose_conv2d.wgsl");
+const TRANSPOSE_2D_WGSL: &str = include_str!("shaders/transpose_2d.wgsl");
+const GATHER_WGSL: &str = include_str!("shaders/gather.wgsl");
+const ATTENTION_WGSL: &str = include_str!("shaders/attention.wgsl");
+const GROUP_NORM_WGSL: &str = include_str!("shaders/group_norm.wgsl");
+const RMS_NORM_WGSL: &str = include_str!("shaders/rms_norm.wgsl");
+const BACKWARD_BINARY_WGSL: &str = include_str!("shaders/backward_binary.wgsl");
+const CONV2D_INPUT_GRAD_WGSL: &str = include_str!("shaders/conv2d_input_grad.wgsl");
+const REDUCE_SUM_BACKWARD_WGSL: &str = include_str!("shaders/reduce_sum_backward.wgsl");
 
 // ── Pipeline cache ─────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct Pipelines {
     matmul: wgpu::ComputePipeline,
     elementwise: wgpu::ComputePipeline,
@@ -528,9 +50,23 @@ struct Pipelines {
     depthwise_conv2d: wgpu::ComputePipeline,
     transpose_conv2d: wgpu::ComputePipeline,
     transpose_2d: wgpu::ComputePipeline,
+    gather: wgpu::ComputePipeline,
+    attention: wgpu::ComputePipeline,
+    group_norm: wgpu::ComputePipeline,
+    rms_norm: wgpu::ComputePipeline,
     backward_binary: wgpu::ComputePipeline,
     reduce_sum_backward: wgpu::ComputePipeline,
     conv2d_input_grad: wgpu::ComputePipeline,
+}
+
+// ── GpuBuffer ─────────────────────────────────────────────────────
+
+/// A tensor that lives on GPU memory. No host copy until explicitly requested.
+pub struct GpuBuffer {
+    buffer: wgpu::Buffer,
+    /// Number of f32 elements.
+    size: usize,
+    shape: Vec<usize>,
 }
 
 // ── GpuBackend ─────────────────────────────────────────────────────
@@ -671,6 +207,10 @@ impl GpuBackend {
             depthwise_conv2d: pipe(&mk(DEPTHWISE_CONV2D_WGSL)),
             transpose_conv2d: pipe(&mk(TRANSPOSE_CONV2D_WGSL)),
             transpose_2d: pipe(&mk(TRANSPOSE_2D_WGSL)),
+            gather: pipe(&mk(GATHER_WGSL)),
+            attention: pipe(&mk(ATTENTION_WGSL)),
+            group_norm: pipe(&mk(GROUP_NORM_WGSL)),
+            rms_norm: pipe(&mk(RMS_NORM_WGSL)),
             backward_binary: pipe(&mk(BACKWARD_BINARY_WGSL)),
             reduce_sum_backward: pipe(&mk(REDUCE_SUM_BACKWARD_WGSL)),
             conv2d_input_grad: pipe(&mk(CONV2D_INPUT_GRAD_WGSL)),
@@ -743,6 +283,166 @@ impl GpuBackend {
                 contents: data,
                 usage: wgpu::BufferUsages::UNIFORM,
             })
+    }
+
+    // ── Device-resident tensor operations ─────────────────────────
+
+    /// Upload a CPU tensor to GPU, returning a device-resident handle.
+    pub fn upload(&self, tensor: &Tensor) -> GpuBuffer {
+        let data = tensor.data();
+        let buffer = self.storage_buf(data);
+        GpuBuffer {
+            buffer,
+            size: data.len(),
+            shape: tensor.shape().to_vec(),
+        }
+    }
+
+    /// Download a GPU buffer back to a CPU tensor.
+    pub fn download(&self, buf: &GpuBuffer) -> Tensor {
+        let data = self.read_buf(&buf.buffer, buf.size);
+        Tensor::from_vec(buf.shape.clone(), data).expect("shape matches data")
+    }
+
+    /// Run a shader with GPU-resident inputs, producing a GPU-resident output.
+    /// No host<->device copy occurs.
+    pub fn dispatch_on_device(
+        &self,
+        input_bufs: &[&GpuBuffer],
+        output_size: usize,
+        output_shape: Vec<usize>,
+        pipeline: &wgpu::ComputePipeline,
+        uniform_data: &[u8],
+        workgroups: (u32, u32, u32),
+    ) -> GpuBuffer {
+        let buf_out = self.output_buf(output_size);
+        let buf_p = self.uniform_buf(uniform_data);
+
+        let bgl = pipeline.get_bind_group_layout(0);
+        let mut entries: Vec<wgpu::BindGroupEntry> = Vec::new();
+        for (i, gb) in input_bufs.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: gb.buffer.as_entire_binding(),
+            });
+        }
+        entries.push(wgpu::BindGroupEntry {
+            binding: input_bufs.len() as u32,
+            resource: buf_out.as_entire_binding(),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: (input_bufs.len() + 1) as u32,
+            resource: buf_p.as_entire_binding(),
+        });
+
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &entries,
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+        }
+        self.queue.submit(Some(enc.finish()));
+
+        GpuBuffer {
+            buffer: buf_out,
+            size: output_size,
+            shape: output_shape,
+        }
+    }
+
+    // ── Internal device-resident dispatch helpers ─────────────────
+
+    /// Elementwise op entirely on device buffers, returning a device buffer.
+    #[allow(dead_code)]
+    fn gpu_elementwise_on_device(
+        &self,
+        a: &wgpu::Buffer,
+        b: &wgpu::Buffer,
+        len: usize,
+        op: u32,
+    ) -> wgpu::Buffer {
+        let buf_out = self.output_buf(len);
+        let params: [u32; 2] = [len as u32, op];
+        let buf_p = self.uniform_buf(bytemuck::cast_slice(&params));
+
+        let bgl = self.pipelines.elementwise.get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf_p.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.elementwise);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(div_ceil(len as u32, 256), 1, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+        buf_out
+    }
+
+    /// Unary op entirely on device buffers, returning a device buffer.
+    #[allow(dead_code)]
+    fn gpu_unary_on_device(&self, a: &wgpu::Buffer, len: usize, op: u32) -> wgpu::Buffer {
+        let buf_out = self.output_buf(len);
+        let params: [u32; 2] = [len as u32, op];
+        let buf_p = self.uniform_buf(bytemuck::cast_slice(&params));
+
+        let bgl = self.pipelines.unary.get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_p.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.unary);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(div_ceil(len as u32, 256), 1, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+        buf_out
     }
 
     fn read_buf(&self, buffer: &wgpu::Buffer, len: usize) -> Vec<f32> {
@@ -1661,7 +1361,84 @@ impl Backend for GpuBackend {
         input: &Tensor,
         params: GroupNormNhwcParams<'_>,
     ) -> Result<Tensor, KernelError> {
-        crate::group_norm_nhwc(input, params)
+        let shape = input.shape();
+        if shape.len() != 4 {
+            return crate::group_norm_nhwc(input, params);
+        }
+        let (n, h, w, c) = (shape[0], shape[1], shape[2], shape[3]);
+        let spatial = h * w;
+        let total = n * c * spatial;
+        if total < MIN_GPU_ELEMENTS {
+            return crate::group_norm_nhwc(input, params);
+        }
+
+        let buf_in = self.storage_buf(input.data());
+        let buf_g = self.storage_buf(params.gamma.data());
+        let buf_b = self.storage_buf(params.beta.data());
+        let buf_out = self.output_buf(total);
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct P {
+            n: u32,
+            c: u32,
+            spatial: u32,
+            groups: u32,
+            eps: f32,
+            _pad1: u32,
+            _pad2: u32,
+            _pad3: u32,
+        }
+        let p = P {
+            n: n as u32,
+            c: c as u32,
+            spatial: spatial as u32,
+            groups: params.num_groups as u32,
+            eps: params.epsilon,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let buf_p = self.uniform_buf(bytemuck::bytes_of(&p));
+
+        let bgl = self.pipelines.group_norm.get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_in.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_g.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf_out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buf_p.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.group_norm);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(div_ceil(total as u32, 256), 1, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+        let data = self.read_buf(&buf_out, total);
+        Tensor::from_vec(shape.to_vec(), data).map_err(Into::into)
     }
 
     fn rms_norm_last_dim(
@@ -1669,7 +1446,70 @@ impl Backend for GpuBackend {
         input: &Tensor,
         params: RmsNormLastDimParams<'_>,
     ) -> Result<Tensor, KernelError> {
-        crate::rms_norm_last_dim(input, params)
+        let shape = input.shape();
+        if shape.is_empty() {
+            return crate::rms_norm_last_dim(input, params);
+        }
+        let cols = *shape.last().expect("non-empty shape");
+        let rows = input.data().len() / cols;
+        if rows * cols < MIN_GPU_ELEMENTS {
+            return crate::rms_norm_last_dim(input, params);
+        }
+
+        let buf_in = self.storage_buf(input.data());
+        let buf_g = self.storage_buf(params.gamma.data());
+        let buf_out = self.output_buf(rows * cols);
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct P {
+            rows: u32,
+            cols: u32,
+            eps: f32,
+            _pad: u32,
+        }
+        let p = P {
+            rows: rows as u32,
+            cols: cols as u32,
+            eps: params.epsilon,
+            _pad: 0,
+        };
+        let buf_p = self.uniform_buf(bytemuck::bytes_of(&p));
+
+        let bgl = self.pipelines.rms_norm.get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_in.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_g.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf_p.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.rms_norm);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(div_ceil(rows as u32, 256), 1, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+        let data = self.read_buf(&buf_out, rows * cols);
+        Tensor::from_vec(shape.to_vec(), data).map_err(Into::into)
     }
 }
 
