@@ -136,6 +136,8 @@ cargo test --workspace --release      # 1,659 tests
 cargo run --example train_cnn         # train a CNN on synthetic data
 cargo run --example train_linear      # linear regression
 cargo run --example image_processing  # image pipeline demo
+cargo run --example yolo_detect -- model.onnx photo.jpg  # YOLOv8/v11 detection
+cargo run --example yolo_finetune     # fine-tune a detection head
 ```
 
 ### System dependencies
