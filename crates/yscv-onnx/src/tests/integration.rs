@@ -233,6 +233,115 @@ fn split_opset13_input_tensor_sizes() {
     assert_eq!(out_b.data(), &[30.0, 40.0, 50.0, 60.0]);
 }
 
+/// Regression: 0-D scalar TensorProto (dims=[]) must produce a true 0-D
+/// tensor, not a 1-D [1] tensor. This is critical for Shape→Gather→Unsqueeze
+/// chains in YOLO11 attention: Gather with scalar index reduces rank, then
+/// Unsqueeze adds it back. If scalars are [1] instead of [], rank inflation
+/// causes Concat shape mismatches.
+#[test]
+fn scalar_initializer_gather_unsqueeze_concat() {
+    // Shape([1,4,2,2]) → [4]
+    // Gather([4], scalar_idx=2) → scalar []  (not [1]!)
+    // Unsqueeze(scalar, axes=[0]) → [1]
+    // Also have a plain [1] initializer (simulates constant-folded value)
+    // Concat([1], [1], axis=0) → [2]
+    // Reshape(input[1,4], [2]) → [2, 2]
+
+    // Scalar index initializer (0-D): value=2
+    let idx_init = onnx::TensorProto {
+        name: Some("idx".into()),
+        dims: vec![], // 0-D scalar!
+        data_type: Some(1),
+        float_data: vec![2.0],
+        ..Default::default()
+    };
+    // 1-D initializer: value=[4]  (simulates a constant-folded Unsqueeze)
+    let four_init = onnx::TensorProto {
+        name: Some("four".into()),
+        dims: vec![1],
+        data_type: Some(1),
+        float_data: vec![4.0],
+        ..Default::default()
+    };
+    // Axes for unsqueeze
+    let axes_init = onnx::TensorProto {
+        name: Some("axes".into()),
+        dims: vec![1],
+        data_type: Some(1),
+        float_data: vec![0.0],
+        ..Default::default()
+    };
+
+    let shape_node = onnx::NodeProto {
+        op_type: Some("Shape".into()),
+        name: Some("shape0".into()),
+        input: vec!["input".into()],
+        output: vec!["shape_out".into()],
+        ..Default::default()
+    };
+    // Gather(shape=[4], idx=scalar) → scalar value
+    let gather_node = onnx::NodeProto {
+        op_type: Some("Gather".into()),
+        name: Some("gather0".into()),
+        input: vec!["shape_out".into(), "idx".into()],
+        output: vec!["gathered".into()],
+        ..Default::default()
+    };
+    // Unsqueeze(scalar, axes=[0]) → [1]
+    let unsqueeze_node = onnx::NodeProto {
+        op_type: Some("Unsqueeze".into()),
+        name: Some("unsq0".into()),
+        input: vec!["gathered".into(), "axes".into()],
+        output: vec!["unsqueezed".into()],
+        ..Default::default()
+    };
+    // Concat([1], [1]) → [2] shape target
+    let concat_node = onnx::NodeProto {
+        op_type: Some("Concat".into()),
+        name: Some("cat0".into()),
+        input: vec!["unsqueezed".into(), "four".into()],
+        output: vec!["new_shape".into()],
+        attribute: vec![make_int_attr("axis", 0)],
+        ..Default::default()
+    };
+    // Reshape [1, 8] → [2, 4]  (gathered dim=2 from shape[1,2,2,2])
+    let reshape_node = onnx::NodeProto {
+        op_type: Some("Reshape".into()),
+        name: Some("reshape0".into()),
+        input: vec!["input".into(), "new_shape".into()],
+        output: vec!["output".into()],
+        ..Default::default()
+    };
+
+    let bytes = build_minimal_onnx_model(
+        vec![
+            shape_node,
+            gather_node,
+            unsqueeze_node,
+            concat_node,
+            reshape_node,
+        ],
+        vec![idx_init, four_init, axes_init],
+        vec!["input", "idx", "four", "axes"],
+        vec!["output"],
+    );
+    let model = load_onnx_model(&bytes).unwrap();
+
+    // Input shape [1, 2, 2, 2] → Shape produces [1, 2, 2, 2]
+    // Gather(idx=2) → scalar 2.0
+    // Unsqueeze → [1] = [2.0]
+    // Concat with [4.0] → [2.0, 4.0]
+    // Reshape [1, 2, 2, 2] (8 elements) as [2, 4]
+    let input = Tensor::from_vec(vec![1, 2, 2, 2], (0..8).map(|i| i as f32).collect()).unwrap();
+    let mut feed = HashMap::new();
+    feed.insert("input".to_string(), input);
+
+    let result = run_onnx_model(&model, feed).unwrap();
+    let output = &result["output"];
+    assert_eq!(output.shape(), &[2, 4]);
+    assert_eq!(output.data(), &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+}
+
 /// Regression: end-to-end YOLO-like pipeline.
 /// Conv → Sigmoid → Mul (SiLU) → Reshape → Transpose, verifying that
 /// (a) Sigmoid produces values in [0, 1] and (b) Constant-driven Reshape

@@ -199,8 +199,11 @@ fn convert_tensor_proto(tp: &onnx::TensorProto) -> Result<Tensor, OnnxError> {
         });
     }
 
-    let final_shape = if shape.is_empty() { vec![1] } else { shape };
-    Tensor::from_vec(final_shape, data).map_err(|e| OnnxError::DecodeFailed {
+    // Preserve 0-D scalar shapes: ONNX TensorProto with dims=[] is a 0-D
+    // scalar, not a 1-D tensor.  Many graph patterns (Gather with scalar
+    // indices → Unsqueeze → Concat for reshape targets) depend on correct
+    // rank propagation.
+    Tensor::from_vec(shape, data).map_err(|e| OnnxError::DecodeFailed {
         message: e.to_string(),
     })
 }
