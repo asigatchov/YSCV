@@ -51,5 +51,13 @@ path = "src/yolo_detect.rs"
 name = "yolo_finetune"
 path = "src/yolo_finetune.rs"
 
+[[example]]
+name = "vball_grid_infer"
+path = "src/vball_grid_infer.rs"
+
+[[example]]
+name = "vball_grid_probe"
+path = "src/vball_grid_probe.rs"
+
 [lints]
 workspace = true

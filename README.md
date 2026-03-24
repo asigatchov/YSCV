@@ -138,6 +138,40 @@ cargo run --example train_linear      # linear regression
 cargo run --example image_processing  # image pipeline demo
 cargo run --example yolo_detect -- model.onnx photo.jpg  # YOLOv8/v11 detection
 cargo run --example yolo_finetune     # fine-tune a detection head
+cargo run --example vball_grid_infer -- onnx2convert/VballNetGridV1b_seq9_grayscale_20260319_193937.onnx frames_dir ball.csv
+```
+
+## VballNetGridV1b ONNX inference
+
+The repository includes a Rust example that runs the volleyball grid model directly through `yscv-onnx`:
+
+```bash
+cargo run --example vball_grid_infer -- \
+  onnx2convert/VballNetGridV1b_seq9_grayscale_20260319_193937.onnx \
+  /path/to/frames_or_video \
+  ball.csv
+```
+
+Supported inputs:
+
+- directory with ordered frame images (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`)
+- `.mp4` video through `yscv-video`
+- `.rcv` raw video through `yscv-video`
+
+The example mirrors the Python preprocessing from `onnx2convert/inference_onnx_seq_gray_v2.py` for the grid model:
+
+- converts frames to grayscale
+- resizes to `768x432`
+- packs `9` frames into ONNX input tensor `[1, 9, 432, 768]`
+- decodes the grid output to `Frame,Visibility,X,Y` CSV rows
+
+Optional confidence threshold:
+
+```bash
+YSCV_CONF_THRESHOLD=0.35 cargo run --example vball_grid_infer -- \
+  onnx2convert/VballNetGridV1b_seq9_grayscale_20260319_193937.onnx \
+  /path/to/frames_or_video \
+  ball.csv
 ```
 
 ### System dependencies

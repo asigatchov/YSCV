@@ -3,9 +3,15 @@ use std::path::PathBuf;
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let generated = out_dir.join("onnx.rs");
+    let system_protoc = PathBuf::from("/usr/bin/protoc");
+    let mut config = prost_build::Config::new();
+
+    if system_protoc.exists() {
+        config.protoc_executable(system_protoc);
+    }
 
     // Try to compile protos with protoc
-    match prost_build::Config::new().compile_protos(&["proto/onnx-ml.proto"], &["proto/"]) {
+    match config.compile_protos(&["proto/onnx-ml.proto"], &["proto/"]) {
         Ok(()) => {
             // Success — prost wrote onnx.rs to OUT_DIR
         }
