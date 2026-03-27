@@ -1,4 +1,12 @@
 fn main() {
+    // Link MetalPerformanceShaders.framework when metal-backend is enabled (macOS).
+    #[cfg(feature = "metal-backend")]
+    {
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
+        }
+    }
+
     // Link Intel MKL VML when the "mkl" feature is enabled (x86/x86_64 only).
     #[cfg(feature = "mkl")]
     {

@@ -16,6 +16,7 @@ blas = []
 mkl = []
 armpl = []
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+metal-backend = ["dep:metal", "dep:objc", "dep:block", "dep:foreign-types"]
 
 [dependencies]
 bytemuck = { version = "1", optional = true, features = ["derive"] }
@@ -23,7 +24,11 @@ pollster = { version = "0.4", optional = true }
 rayon = "1.11"
 yscv-tensor = { version = "0.1", path = "../yscv-tensor" }
 thiserror.workspace = true
-wgpu = { version = "24", optional = true }
+wgpu = { version = "29", optional = true }
+metal = { version = "0.18", optional = true }
+objc = { version = "0.2", optional = true }
+block = { version = "0.1", optional = true }
+foreign-types = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

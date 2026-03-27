@@ -1,5 +1,6 @@
 use yscv_tensor::Tensor;
 
+use super::assert_slice_close;
 use crate::{BatchNorm2dParams, LayerNormLastDimParams, batch_norm2d_nhwc, layer_norm_last_dim};
 
 /// Compare GPU batch-norm result with CPU reference.

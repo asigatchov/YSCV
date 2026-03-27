@@ -37,6 +37,13 @@ venv/
 # Benchmark output (generated, not committed)
 criterion/
 
+# Models (large binary files)
+*.onnx
+examples/src/slowwork/
+
+# Profiler output
+onnxruntime_profile__*.json
+
 # Misc
 *.log
 *.tmp

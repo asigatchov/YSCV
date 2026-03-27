@@ -13,7 +13,7 @@ mod linalg;
 mod ops;
 #[path = "shape.rs"]
 mod shape;
-#[path = "simd.rs"]
+#[path = "simd/mod.rs"]
 mod simd;
 #[path = "tensor.rs"]
 mod tensor;

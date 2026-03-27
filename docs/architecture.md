@@ -96,7 +96,8 @@ If you need to change something, these are the most important files:
 | Tensor core | `crates/yscv-tensor/src/tensor.rs` |
 | Autograd graph | `crates/yscv-autograd/src/graph.rs` |
 | CPU backend | `crates/yscv-kernels/src/backend.rs` |
-| ONNX runtime | `crates/yscv-onnx/src/runtime.rs` |
+| ONNX runtime | `crates/yscv-onnx/src/runner/mod.rs` |
+| Metal plan compiler | `crates/yscv-onnx/src/runner/metal.rs` |
 | Benchmark harness | `apps/bench/src/main.rs` |
 | OpenCV comparison | `bench_opencv.py` |
 | CI pipeline | `.github/workflows/ci.yml` |
@@ -117,6 +118,43 @@ If you need to change something, these are the most important files:
 | Allocator | mimalloc | mimalloc | mimalloc |
 
 All SIMD dispatch paths include scalar fallback for architectures without runtime detection support (e.g., RISC-V, WASM) and for Miri testing.
+
+## GPU execution pipeline
+
+The framework has three tiers of GPU execution, each with different trade-offs:
+
+### Tier 1: Interpreted wgpu (generic)
+`yscv-kernels` `gpu` feature provides a `GpuBackend` using wgpu compute shaders (WGSL). This works on Vulkan, Metal, and DX12. Each kernel call is dispatched independently. Best for single-op acceleration or when portability across GPU APIs matters.
+
+### Tier 2: Compiled Metal-native (fast)
+`yscv-kernels` `metal-backend` feature provides a `MetalInference` backend that compiles an entire ONNX model into a sequence of `MetalOp`s executed in a single fused command buffer. Beats Apple CoreML on YOLOv8n (11.8ms vs 13.4ms — 14% faster, and CoreML uses dedicated Neural Engine hardware). Key optimizations:
+
+- **Winograd F(4×4, 3×3)**: 2.25× fewer FLOPs for 3×3 stride-1 convolutions; SIMD group matrix multiply (`simdgroup_matrix_multiply_accumulate`) with half×half→float accumulation, 36-batch GEMM (6×6 tiles), double-buffered scratch for pipelining
+- **Tiled f16 conv GEMM**: BM=64, BN=64, BK=16, TM=4, TN=4 — 16 half4 accumulators per thread with bank-conflict padding (SA_STRIDE=17, SB_STRIDE=65); specialized 1×1, 3×3, small-channel, and depthwise variants
+- **F16 inter-op pipeline**: All intermediate buffers use f16, halving memory bandwidth; weights pre-packed as f16 at compile time
+- **NEON CPU-side input upload**: `fcvtn`+`st3` instructions convert f32 NCHW → f16 NHWC at upload time (0.09ms), eliminating a GPU cast kernel and halving the upload data size
+- **Conv+SiLU+Add residual fusion**: Fuses activation and residual addition into conv write-back epilogue
+- **Widened SiLU look-ahead**: Detects SiLU patterns up to 5 nodes ahead (handles detection head branch interleaving)
+- **Vectorized f16 utility kernels**: All non-conv ops (concat, split, permute, resize, binary, unary) use `half4` vectorized I/O with multi-dimensional threadgroup grids
+- **Concat fusion**: Conv outputs write directly into concat output buffer via `out_stride`/`out_offset` parameters, eliminating separate concat copies
+- **In-place elementwise ops**: SiLU, binary, and unary ops reuse dead input buffers as output (lifetime analysis during compilation)
+- **Fast divmod**: Float-based integer division for im2col (~4 cycles vs ~20 cycles for GPU integer division)
+- **Parallel softmax**: Shared-memory threadgroup reduction with adaptive threadgroup size (32/128/256 threads)
+- **Zero-cost buffer aliasing**: Reshape/Flatten/Squeeze/Unsqueeze with matching element counts alias existing Metal buffers instead of GPU copies
+
+### Tier 3: SIMD group conv (specialized)
+`conv3x3_simd_f16io` and `conv1x1_simd_f16io` use Apple's `simdgroup_matrix_multiply_accumulate` for convolution with SIMD group tiling (8 SIMD groups per threadgroup, 4×2 sub-tile layout covering 32×16 output elements). Used for medium-to-large channel counts where occupancy is sufficient.
+
+### Key files
+
+| What | Where |
+|---|---|
+| Metal backend | `crates/yscv-kernels/src/metal_backend.rs` |
+| Metal plan compiler | `crates/yscv-onnx/src/runner/metal.rs` |
+| Conv GEMM shader | `crates/yscv-kernels/src/shaders/conv_gemm_metal_basic.metal` |
+| Winograd shader | `crates/yscv-kernels/src/shaders/conv_winograd.metal` |
+| Utility shaders | `crates/yscv-kernels/src/shaders/metal_ops.metal` |
+| SIMD group shader | `crates/yscv-kernels/src/shaders/conv_gemm_simd.metal` |
 
 ## Safety invariants
 

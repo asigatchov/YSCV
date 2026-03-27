@@ -358,6 +358,7 @@ pub fn fold_constants(model: &mut OnnxModel) {
             outputs: node.outputs.clone(),
             initializers: HashMap::new(),
             nodes: vec![node.clone()],
+            khwc_weights: HashSet::new(),
         };
 
         // Gather inputs for the mini model

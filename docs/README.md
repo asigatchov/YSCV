@@ -4,9 +4,13 @@ This directory contains the technical documentation for the yscv framework. Each
 
 ## Getting oriented
 
-If you are new to the project, start with the root [README.md](../README.md) for a high-level overview of what yscv is and how to build it. Then come back here for the details.
+If you are new to the project, start with the root [README.md](../README.md) for a high-level overview, then read the **Cookbook** for hands-on recipes.
 
 ## Documents
+
+### [cookbook.md](cookbook.md)
+
+**Start here.** Practical recipes for every common task — from loading an image to GPU inference to cross-compilation. Each recipe is self-contained with copy-paste code and the exact `cargo run` command. Covers: image processing, training (linear/CNN), ONNX inference (CPU/GPU/Metal), YOLO detection, tracking, preprocessing pipelines, fine-tuning, video, deployment, feature flags, and benchmarking.
 
 ### [architecture.md](architecture.md)
 

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+gpu = ["yscv-onnx/gpu", "yscv-kernels/gpu"]
+metal-backend = ["yscv-kernels/metal-backend", "yscv-onnx/metal-backend"]
+
 [dependencies]
 yscv-tensor = { path = "../crates/yscv-tensor" }
 yscv-autograd = { path = "../crates/yscv-autograd" }
@@ -50,6 +55,30 @@ path = "src/yolo_detect.rs"
 [[example]]
 name = "yolo_finetune"
 path = "src/yolo_finetune.rs"
+
+[[example]]
+name = "bench_yolo"
+path = "src/bench_yolo.rs"
+
+[[example]]
+name = "bench_gpu"
+path = "src/bench_gpu.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "bench_metal_yolo"
+path = "src/bench_metal_yolo.rs"
+required-features = ["metal-backend"]
+
+[[example]]
+name = "bench_metal_conv"
+path = "src/bench_metal_conv.rs"
+required-features = ["metal-backend"]
+
+[[example]]
+name = "bench_mps_gemm"
+path = "src/bench_mps_gemm.rs"
+required-features = ["metal-backend"]
 
 [lints]
 workspace = true

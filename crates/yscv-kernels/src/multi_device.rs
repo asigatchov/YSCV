@@ -53,15 +53,15 @@ pub struct GpuDeviceInfo {
 /// Call this once at startup to decide which device indices to pass to
 /// [`MultiGpuBackend::new`].
 pub fn enumerate_gpu_devices() -> Vec<GpuDeviceInfo> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
-    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
     adapters
         .iter()
-        .map(|adapter| {
+        .map(|adapter: &wgpu::Adapter| {
             let info = adapter.get_info();
             let limits = adapter.limits();
             GpuDeviceInfo {

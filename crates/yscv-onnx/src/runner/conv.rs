@@ -1,7 +1,14 @@
 use super::*;
 
-/// ONNX Conv: NCHW input, OIHW weight -> convert to NHWC for yscv kernels, then back.
-pub(super) fn exec_conv(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
+/// ONNX Conv: NHWC-aware. Skips layout conversion if input is already NHWC.
+/// Output is left in NHWC to avoid redundant conversions in spatial chains.
+/// `activation` is applied fused into GEMM tiles (cache-hot) when using BLAS padded path.
+pub(super) fn exec_conv(
+    node: &OnnxNode,
+    env: &mut TensorEnv,
+    activation: yscv_kernels::Activation,
+) -> Result<(), OnnxError> {
+    let input_is_nhwc = env.is_nhwc(&node.inputs[0]);
     let input = get_tensor(env, &node.name, &node.inputs[0])?;
     let weight = get_tensor(env, &node.name, &node.inputs[1])?;
     let bias = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
@@ -17,38 +24,88 @@ pub(super) fn exec_conv(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), Onnx
     let sh = strides[0] as usize;
     let sw = strides[1] as usize;
 
-    // NCHW -> NHWC
-    let input_nhwc = nchw_to_nhwc(input)?;
+    // Skip NCHW→NHWC if input is already NHWC
+    let input_nhwc_owned;
+    let input_nhwc: &Tensor = if input_is_nhwc {
+        input
+    } else {
+        input_nhwc_owned = nchw_to_nhwc(input)?;
+        &input_nhwc_owned
+    };
 
     // Weight: ONNX [O, I/group, KH, KW] -> yscv [KH, KW, I/group, O]
     let w_shape = weight.shape();
     let (o_ch, i_per_g, kh, kw) = (w_shape[0], w_shape[1], w_shape[2], w_shape[3]);
 
-    // Apply padding if non-zero
-    let input_padded = if pads.iter().any(|&p| p > 0) {
-        pad_nhwc(
-            &input_nhwc,
-            pads[0] as usize,
-            pads[1] as usize,
-            pads[2] as usize,
-            pads[3] as usize,
-        )?
-    } else {
-        input_nhwc
-    };
+    let has_padding = pads.iter().any(|&p| p > 0);
+    let (pt, pl, pb, pr) = (
+        pads[0] as usize,
+        pads[1] as usize,
+        pads[2] as usize,
+        pads[3] as usize,
+    );
 
     if group == 1 {
-        let w_nhwc = oihw_to_khwc_cout(weight)?;
-        let out_nhwc = conv2d_nhwc(&input_padded, &w_nhwc, bias, sh, sw).map_err(|e| {
-            OnnxError::DecodeFailed {
-                message: e.to_string(),
+        // Use pre-permuted weight if available (OIHW→KHWC done once upfront).
+        let w_nhwc_owned;
+        let w_nhwc: &Tensor = if env.is_khwc_weight(&node.inputs[1]) {
+            weight
+        } else {
+            w_nhwc_owned = oihw_to_khwc_cout(weight)?;
+            &w_nhwc_owned
+        };
+        // BLAS padded path fuses activation inside GEMM tiles (cache-hot).
+        // All other paths apply activation afterward.
+        let (mut out_nhwc, activation_fused) = if has_padding {
+            #[cfg(feature = "blas")]
+            {
+                let t = yscv_kernels::conv2d_nhwc_padded(
+                    input_nhwc, w_nhwc, bias, sh, sw, pt, pl, pb, pr, activation,
+                )
+                .map_err(|e| OnnxError::DecodeFailed {
+                    message: e.to_string(),
+                })?;
+                (t, true) // activation applied in-tile
             }
-        })?;
-        let out_nchw = nhwc_to_nchw(&out_nhwc)?;
-        env.insert(node.outputs[0].clone(), out_nchw);
-    } else if group as usize == o_ch && group as usize == input.shape()[1] {
-        // Depthwise: each group has 1 input channel and 1 output channel
-        // Convert to yscv depthwise format [KH, KW, C, depth_mult=1]
+            #[cfg(not(feature = "blas"))]
+            {
+                let padded = pad_nhwc(input_nhwc, pt, pl, pb, pr)?;
+                let t = conv2d_nhwc(&padded, w_nhwc, bias, sh, sw).map_err(|e| {
+                    OnnxError::DecodeFailed {
+                        message: e.to_string(),
+                    }
+                })?;
+                (t, false)
+            }
+        } else {
+            let t = conv2d_nhwc(input_nhwc, w_nhwc, bias, sh, sw).map_err(|e| {
+                OnnxError::DecodeFailed {
+                    message: e.to_string(),
+                }
+            })?;
+            (t, false)
+        };
+        if !activation_fused && activation == yscv_kernels::Activation::Silu {
+            yscv_kernels::silu_inplace(&mut out_nhwc);
+        }
+        env.insert(node.outputs[0].clone(), out_nhwc);
+        env.mark_nhwc(&node.outputs[0]);
+    } else if group as usize == o_ch
+        && group as usize
+            == if input_is_nhwc {
+                input.shape()[3]
+            } else {
+                input.shape()[1]
+            }
+    {
+        // Depthwise — pad input if needed
+        let padded_owned;
+        let input_padded: &Tensor = if has_padding {
+            padded_owned = pad_nhwc(input_nhwc, pt, pl, pb, pr)?;
+            &padded_owned
+        } else {
+            input_nhwc
+        };
         let c = group;
         let depth_mult = o_ch / c;
         let mut dw_data = vec![0.0f32; kh * kw * c * depth_mult];
@@ -69,14 +126,21 @@ pub(super) fn exec_conv(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), Onnx
                 message: e.to_string(),
             }
         })?;
-        let out_nhwc = yscv_kernels::depthwise_conv2d_nhwc(&input_padded, &dw_kernel, bias, sh, sw)
+        let out_nhwc = yscv_kernels::depthwise_conv2d_nhwc(input_padded, &dw_kernel, bias, sh, sw)
             .map_err(|e| OnnxError::DecodeFailed {
                 message: e.to_string(),
             })?;
-        let out_nchw = nhwc_to_nchw(&out_nhwc)?;
-        env.insert(node.outputs[0].clone(), out_nchw);
+        env.insert(node.outputs[0].clone(), out_nhwc);
+        env.mark_nhwc(&node.outputs[0]);
     } else {
-        // Grouped convolution: split input channels, run per-group conv, concat
+        // Grouped convolution — pad input if needed
+        let padded_owned;
+        let input_padded: &Tensor = if has_padding {
+            padded_owned = pad_nhwc(input_nhwc, pt, pl, pb, pr)?;
+            &padded_owned
+        } else {
+            input_nhwc
+        };
         let in_shape = input_padded.shape();
         let (n, ih, iw, total_ic) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
         let ic_per_group = total_ic / group;
@@ -127,14 +191,15 @@ pub(super) fn exec_conv(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), Onnx
                 message: e.to_string(),
             }
         })?;
-        let out_nchw = nhwc_to_nchw(&out_nhwc)?;
-        env.insert(node.outputs[0].clone(), out_nchw);
+        env.insert(node.outputs[0].clone(), out_nhwc);
+        env.mark_nhwc(&node.outputs[0]);
     }
 
     Ok(())
 }
 
 pub(super) fn exec_conv_transpose(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
+    let input_is_nhwc = env.is_nhwc(&node.inputs[0]);
     let input = get_tensor(env, &node.name, &node.inputs[0])?;
     let weight = get_tensor(env, &node.name, &node.inputs[1])?;
     let bias = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
@@ -147,7 +212,11 @@ pub(super) fn exec_conv_transpose(node: &OnnxNode, env: &mut TensorEnv) -> Resul
     let sh = strides[0] as usize;
     let sw = strides[1] as usize;
 
-    let input_nhwc = nchw_to_nhwc(input)?;
+    let input_nhwc = if input_is_nhwc {
+        input.clone()
+    } else {
+        nchw_to_nhwc(input)?
+    };
     let w_shape = weight.shape();
     // ONNX ConvTranspose weight: [C_in, C_out, KH, KW]
     let (ic, oc, kh, kw) = (w_shape[0], w_shape[1], w_shape[2], w_shape[3]);
@@ -214,8 +283,8 @@ pub(super) fn exec_conv_transpose(node: &OnnxNode, env: &mut TensorEnv) -> Resul
         Tensor::from_vec(vec![n, oh, ow, oc], out).map_err(|e| OnnxError::DecodeFailed {
             message: e.to_string(),
         })?;
-    let out_nchw = nhwc_to_nchw(&out_nhwc)?;
-    env.insert(node.outputs[0].clone(), out_nchw);
+    env.insert(node.outputs[0].clone(), out_nhwc);
+    env.mark_nhwc(&node.outputs[0]);
     Ok(())
 }
 
@@ -258,7 +327,7 @@ pub(super) fn exec_qlinear_conv(node: &OnnxNode, env: &mut TensorEnv) -> Result<
     if let Some(b) = bias {
         env.insert("__qb".into(), b);
     }
-    exec_conv(&float_node, env)?;
+    exec_conv(&float_node, env, yscv_kernels::Activation::None)?;
     let float_out = env
         .remove("__qconv_out")
         .ok_or_else(|| OnnxError::MissingInput {
@@ -316,7 +385,7 @@ pub(super) fn exec_conv_integer(node: &OnnxNode, env: &mut TensorEnv) -> Result<
     };
     env.insert("__ci_x".into(), t_x);
     env.insert("__ci_w".into(), t_w);
-    exec_conv(&conv_node, env)?;
+    exec_conv(&conv_node, env, yscv_kernels::Activation::None)?;
     let out = env
         .remove("__ci_out")
         .ok_or_else(|| OnnxError::MissingInput {
@@ -340,14 +409,6 @@ pub(super) fn exec_conv_integer(node: &OnnxNode, env: &mut TensorEnv) -> Result<
 pub(super) fn nchw_to_nhwc(input: &Tensor) -> Result<Tensor, OnnxError> {
     input
         .permute(&[0, 2, 3, 1])
-        .map_err(|e| OnnxError::DecodeFailed {
-            message: e.to_string(),
-        })
-}
-
-pub(super) fn nhwc_to_nchw(input: &Tensor) -> Result<Tensor, OnnxError> {
-    input
-        .permute(&[0, 3, 1, 2])
         .map_err(|e| OnnxError::DecodeFailed {
             message: e.to_string(),
         })
@@ -387,15 +448,13 @@ pub(super) fn pad_nhwc_val(
     let ow = w + left + right;
     let mut out = vec![val; n * oh * ow * c];
     let in_data = input.data();
+    let row_bytes = w * c;
     for batch in 0..n {
         for row in 0..h {
-            for col in 0..w {
-                for ch in 0..c {
-                    let src = ((batch * h + row) * w + col) * c + ch;
-                    let dst = ((batch * oh + row + top) * ow + col + left) * c + ch;
-                    out[dst] = in_data[src];
-                }
-            }
+            let src_start = (batch * h + row) * w * c;
+            let dst_start = ((batch * oh + row + top) * ow + left) * c;
+            out[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&in_data[src_start..src_start + row_bytes]);
         }
     }
     Tensor::from_vec(vec![n, oh, ow, c], out).map_err(|e| OnnxError::DecodeFailed {

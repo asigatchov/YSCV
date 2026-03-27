@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use prost::Message;
 use yscv_tensor::Tensor;
@@ -45,6 +45,8 @@ pub struct OnnxModel {
     pub outputs: Vec<String>,
     pub initializers: HashMap<String, Tensor>,
     pub nodes: Vec<OnnxNode>,
+    /// Conv weight names that were pre-permuted OIHW → KHWC at load time.
+    pub(crate) khwc_weights: HashSet<String>,
 }
 
 impl OnnxModel {
@@ -111,6 +113,38 @@ pub fn load_onnx_model(data: &[u8]) -> Result<OnnxModel, OnnxError> {
         });
     }
 
+    // Pre-permute group=1 Conv weights OIHW → KHWC at load time
+    // so we don't pay the ~11ms permutation cost on every inference call.
+    let mut khwc_weights = HashSet::new();
+    for node in &nodes {
+        if node.op_type != "Conv" || node.inputs.len() < 2 {
+            continue;
+        }
+        let weight_name = &node.inputs[1];
+        if khwc_weights.contains(weight_name) {
+            continue;
+        }
+        // Only pre-permute group=1 conv weights
+        let group = node
+            .attributes
+            .get("group")
+            .and_then(|a| match a {
+                OnnxAttribute::Int(v) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or(1);
+        if group != 1 {
+            continue;
+        }
+        if let Some(w) = initializers.get(weight_name)
+            && w.rank() == 4
+            && let Ok(permuted) = w.permute(&[2, 3, 1, 0])
+        {
+            initializers.insert(weight_name.clone(), permuted);
+            khwc_weights.insert(weight_name.clone());
+        }
+    }
+
     Ok(OnnxModel {
         ir_version: model_proto.ir_version.unwrap_or(0),
         opset_version,
@@ -120,6 +154,7 @@ pub fn load_onnx_model(data: &[u8]) -> Result<OnnxModel, OnnxError> {
         outputs,
         initializers,
         nodes,
+        khwc_weights,
     })
 }
 

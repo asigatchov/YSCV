@@ -18,4 +18,11 @@
 
 mod core;
 
+#[cfg(all(target_os = "macos", feature = "metal-backend"))]
+#[allow(unsafe_code)]
+pub mod metal_backend;
+
 pub use core::*;
+
+#[cfg(all(target_os = "macos", feature = "metal-backend"))]
+pub use metal_backend::metal_conv::{MetalConv, MetalInference};

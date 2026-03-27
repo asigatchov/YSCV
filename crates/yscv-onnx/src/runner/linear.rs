@@ -14,22 +14,27 @@ pub(super) fn exec_gemm(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), Onnx
     let trans_a = get_attr_int(node, "transA").unwrap_or(0) != 0;
     let trans_b = get_attr_int(node, "transB").unwrap_or(0) != 0;
 
-    let a_final = if trans_a {
-        a.transpose_2d().map_err(|e| OnnxError::DecodeFailed {
+    // Borrow-or-own pattern: avoid cloning when no transpose needed
+    let a_owned;
+    let a_ref: &Tensor = if trans_a {
+        a_owned = a.transpose_2d().map_err(|e| OnnxError::DecodeFailed {
             message: e.to_string(),
-        })?
+        })?;
+        &a_owned
     } else {
-        a.clone()
+        a
     };
-    let b_final = if trans_b {
-        b.transpose_2d().map_err(|e| OnnxError::DecodeFailed {
+    let b_owned;
+    let b_ref: &Tensor = if trans_b {
+        b_owned = b.transpose_2d().map_err(|e| OnnxError::DecodeFailed {
             message: e.to_string(),
-        })?
+        })?;
+        &b_owned
     } else {
-        b.clone()
+        b
     };
 
-    let mut out = matmul_2d(&a_final, &b_final).map_err(|e| OnnxError::DecodeFailed {
+    let mut out = matmul_2d(a_ref, b_ref).map_err(|e| OnnxError::DecodeFailed {
         message: e.to_string(),
     })?;
 
@@ -117,24 +122,10 @@ pub(super) fn exec_matmul(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), On
         };
         let a_slice = &a_data[a_idx * a_mat_stride..(a_idx + 1) * a_mat_stride];
         let b_slice = &b_data[b_idx * b_mat_stride..(b_idx + 1) * b_mat_stride];
-
-        // Wrap slices as rank-2 tensors and delegate to the SIMD kernel
-        let a_2d = Tensor::from_vec(vec![m, k], a_slice.to_vec()).map_err(|e| {
-            OnnxError::DecodeFailed {
-                message: e.to_string(),
-            }
-        })?;
-        let b_2d = Tensor::from_vec(vec![k, n], b_slice.to_vec()).map_err(|e| {
-            OnnxError::DecodeFailed {
-                message: e.to_string(),
-            }
-        })?;
-        let result = matmul_2d(&a_2d, &b_2d).map_err(|e| OnnxError::DecodeFailed {
-            message: e.to_string(),
-        })?;
-
         let dst = &mut out_data[batch_idx * out_mat_stride..(batch_idx + 1) * out_mat_stride];
-        dst.copy_from_slice(result.data());
+
+        // Zero-copy: call BLAS/GEMM directly on slices, no Tensor wrapping
+        matmul_2d_slices(a_slice, m, k, b_slice, n, dst);
     }
 
     let mut out_shape = out_batch;

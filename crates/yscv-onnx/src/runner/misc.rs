@@ -26,8 +26,8 @@ pub(super) fn exec_constant(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), 
 }
 
 pub(super) fn exec_identity(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
-    let input = get_tensor(env, &node.name, &node.inputs[0])?;
-    env.insert(node.outputs[0].clone(), input.clone());
+    // Zero-copy: alias the output to the input (ONNX outputs are write-once)
+    env.alias(&node.outputs[0], &node.inputs[0]);
     Ok(())
 }
 
@@ -129,16 +129,23 @@ pub(super) fn exec_dynamic_quantize_linear(
 }
 
 pub(super) fn exec_resize(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
+    let input_is_nhwc = env.is_nhwc(&node.inputs[0]);
     let input = get_tensor(env, &node.name, &node.inputs[0])?;
     let shape = input.shape();
     if shape.len() != 4 {
         return Err(OnnxError::DecodeFailed {
-            message: "Resize expects NCHW input".into(),
+            message: "Resize expects 4D input".into(),
         });
     }
-    let (n, c, ih, iw) = (shape[0], shape[1], shape[2], shape[3]);
 
-    // Try sizes input (input[3]) first, then scales (input[2])
+    // Determine spatial dims based on layout
+    let (n, ih, iw, c) = if input_is_nhwc {
+        (shape[0], shape[1], shape[2], shape[3])
+    } else {
+        (shape[0], shape[2], shape[3], shape[1])
+    };
+
+    // ONNX sizes/scales are always in NCHW order: [N, C, H, W]
     let (oh, ow) = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
         let sizes = get_tensor(env, &node.name, &node.inputs[3])?;
         let sd = sizes.data();
@@ -151,29 +158,50 @@ pub(super) fn exec_resize(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), On
         (ih, iw)
     };
 
-    // Nearest-neighbor resize in NCHW
     let data = input.data();
-    let mut out = Vec::with_capacity(n * c * oh * ow);
     let sy = ih as f32 / oh as f32;
     let sx = iw as f32 / ow as f32;
-    for b in 0..n {
-        for ch in 0..c {
+
+    if input_is_nhwc {
+        // Nearest-neighbor resize in NHWC — use row-based memcpy for integer 2× upscale
+        let mut out = vec![0.0f32; n * oh * ow * c];
+        for b in 0..n {
             for y in 0..oh {
-                let src_y = ((y as f32 + 0.5) * sy).floor() as usize;
-                let src_y = src_y.min(ih - 1);
+                let src_y = (((y as f32 + 0.5) * sy).floor() as usize).min(ih - 1);
                 for x in 0..ow {
-                    let src_x = ((x as f32 + 0.5) * sx).floor() as usize;
-                    let src_x = src_x.min(iw - 1);
-                    out.push(data[((b * c + ch) * ih + src_y) * iw + src_x]);
+                    let src_x = (((x as f32 + 0.5) * sx).floor() as usize).min(iw - 1);
+                    let src_off = ((b * ih + src_y) * iw + src_x) * c;
+                    let dst_off = ((b * oh + y) * ow + x) * c;
+                    out[dst_off..dst_off + c].copy_from_slice(&data[src_off..src_off + c]);
                 }
             }
         }
+        let out_t =
+            Tensor::from_vec(vec![n, oh, ow, c], out).map_err(|e| OnnxError::DecodeFailed {
+                message: e.to_string(),
+            })?;
+        env.insert(node.outputs[0].clone(), out_t);
+        env.mark_nhwc(&node.outputs[0]);
+    } else {
+        // NCHW path
+        let mut out = Vec::with_capacity(n * c * oh * ow);
+        for b in 0..n {
+            for ch in 0..c {
+                for y in 0..oh {
+                    let src_y = (((y as f32 + 0.5) * sy).floor() as usize).min(ih - 1);
+                    for x in 0..ow {
+                        let src_x = (((x as f32 + 0.5) * sx).floor() as usize).min(iw - 1);
+                        out.push(data[((b * c + ch) * ih + src_y) * iw + src_x]);
+                    }
+                }
+            }
+        }
+        let out_t =
+            Tensor::from_vec(vec![n, c, oh, ow], out).map_err(|e| OnnxError::DecodeFailed {
+                message: e.to_string(),
+            })?;
+        env.insert(node.outputs[0].clone(), out_t);
     }
-
-    let out_t = Tensor::from_vec(vec![n, c, oh, ow], out).map_err(|e| OnnxError::DecodeFailed {
-        message: e.to_string(),
-    })?;
-    env.insert(node.outputs[0].clone(), out_t);
     Ok(())
 }
 

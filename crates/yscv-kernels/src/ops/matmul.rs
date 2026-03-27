@@ -55,6 +55,29 @@ pub fn matmul_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, KernelError> {
     matmul_2d_with_config(lhs, rhs, ParallelMatmulConfig::default())
 }
 
+/// Zero-copy slice-based matmul: C[m×n] = A[m×k] × B[k×n].
+/// Writes directly into `out` without any intermediate allocation.
+#[allow(unsafe_code)]
+pub fn matmul_2d_slices(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut [f32]) {
+    debug_assert!(a.len() >= m * k);
+    debug_assert!(b.len() >= k * n);
+    debug_assert!(out.len() >= m * n);
+
+    #[cfg(feature = "blas")]
+    if use_blas() {
+        blas_sgemm(a, b, out, m, k, n);
+        return;
+    }
+
+    // Non-BLAS fallback: zero-init + blocked or row GEMM
+    out[..m * n].fill(0.0);
+    if use_blocked(m, k, n) {
+        blocked_gemm_sequential(a, b, out, m, k, n);
+    } else {
+        row_gemm_sequential(a, b, out, m, k, n);
+    }
+}
+
 /// Rank-2 matrix multiplication with explicit parallelization heuristics.
 pub fn matmul_2d_with_config(
     lhs: &Tensor,

@@ -10,11 +10,19 @@ repository.workspace = true
 categories.workspace = true
 keywords.workspace = true
 
+[features]
+default = ["blas"]
+blas = ["yscv-kernels/blas"]
+gpu = ["yscv-kernels/gpu"]
+metal-backend = ["yscv-kernels/metal-backend", "dep:metal", "dep:objc"]
+
 [dependencies]
 prost = "0.13"
 yscv-kernels = { version = "0.1", path = "../yscv-kernels" }
 yscv-tensor = { version = "0.1", path = "../yscv-tensor" }
 thiserror.workspace = true
+metal = { version = "0.18", optional = true }
+objc = { version = "0.2", optional = true }
 
 [build-dependencies]
 prost-build = "0.13"

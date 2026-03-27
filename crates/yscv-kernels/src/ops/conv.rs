@@ -7,6 +7,19 @@ use super::config::{
     SeparableConv2dKernels, SeparableConv2dSpec, should_parallelize_len,
 };
 
+/// Post-convolution fused activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    None,
+    Silu,
+}
+
+/// Apply SiLU in-place on a mutable f32 slice.
+#[inline]
+fn silu_slice_inplace(data: &mut [f32]) {
+    super::simd::silu_inplace(data);
+}
+
 pub fn conv2d_nhwc_with_config_and_pool(
     input: &Tensor,
     kernel: &Tensor,
@@ -20,14 +33,21 @@ pub fn conv2d_nhwc_with_config_and_pool(
     // Direct 3×3 microkernel for small inputs (no im2col overhead).
     // For small spatial sizes the im2col copy + BLAS call setup dominates; a
     // direct SIMD kernel that walks the input in-place is significantly faster.
-    // WHY 4096: below this, im2col memory copy (~KH*KW*C*HW floats) + BLAS setup exceeds direct conv cost.
+    // However, for deep channels (large C_in * C_out) the BLAS GEMM has better
+    // cache tiling, so we use a total-work threshold instead of spatial-only.
+    // 2M FLOPs ≈ 0.08ms at 25 GFLOPS — below this the direct kernel wins.
+    // Note: NEON kernel is single-threaded, so BLAS GEMM wins for large spatial
+    // even with few channels due to multi-core parallelism.
     #[cfg(target_arch = "aarch64")]
     if plan.kernel_h == 3
         && plan.kernel_w == 3
         && plan.batch == 1
         && !cfg!(miri)
         && std::arch::is_aarch64_feature_detected!("neon")
-        && plan.out_h * plan.out_w < 4096
+        && (plan.out_h * plan.out_w)
+            .saturating_mul(plan.in_channels)
+            .saturating_mul(plan.out_channels)
+            < 2_000_000
     {
         #[allow(unsafe_code)]
         let mut output = AlignedVec::<f32>::uninitialized(plan.output_len);
@@ -65,7 +85,10 @@ pub fn conv2d_nhwc_with_config_and_pool(
         && !cfg!(miri)
         && is_x86_feature_detected!("avx")
         && is_x86_feature_detected!("fma")
-        && plan.out_h * plan.out_w < 4096
+        && (plan.out_h * plan.out_w)
+            .saturating_mul(plan.in_channels)
+            .saturating_mul(plan.out_channels)
+            < 2_000_000
     {
         #[allow(unsafe_code)]
         let mut output = AlignedVec::<f32>::uninitialized(plan.output_len);
@@ -102,7 +125,10 @@ pub fn conv2d_nhwc_with_config_and_pool(
         && plan.batch == 1
         && !cfg!(miri)
         && is_x86_feature_detected!("fma")
-        && plan.out_h * plan.out_w < 4096
+        && (plan.out_h * plan.out_w)
+            .saturating_mul(plan.in_channels)
+            .saturating_mul(plan.out_channels)
+            < 2_000_000
     {
         #[allow(unsafe_code)]
         let mut output = AlignedVec::<f32>::uninitialized(plan.output_len);
@@ -1556,6 +1582,9 @@ fn depthwise_conv2d_nhwc_row(
 /// Output `col` has shape [out_h * out_w, kH * kW * C_in] (row-major).
 /// The input is NHWC layout (batch dimension already stripped by caller).
 #[cfg(feature = "blas")]
+/// im2col for NHWC input without padding.
+/// Uses unsafe pointer arithmetic to avoid per-element bounds checks.
+#[allow(unsafe_code)]
 fn im2col_nhwc(
     input: &[f32],
     in_w: usize,
@@ -1569,20 +1598,62 @@ fn im2col_nhwc(
     col: &mut [f32],
 ) {
     let k = kh * kw * c;
-    for oy in 0..out_h {
-        for ox in 0..out_w {
-            let row = oy * out_w + ox;
-            let row_off = row * k;
-            for ky in 0..kh {
-                let iy = oy * stride_h + ky;
-                for kx in 0..kw {
-                    let ix = ox * stride_w + kx;
-                    let src_off = (iy * in_w + ix) * c;
-                    let dst_off = row_off + (ky * kw + kx) * c;
-                    col[dst_off..dst_off + c].copy_from_slice(&input[src_off..src_off + c]);
+    let in_row_stride = in_w * c;
+    // SAFETY: all (oy*stride_h+ky, ox*stride_w+kx) are guaranteed in-bounds
+    // because the output dimensions were computed from valid convolution params.
+    unsafe {
+        let inp = input.as_ptr();
+        let mut dst = col.as_mut_ptr();
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                for ky in 0..kh {
+                    let src_row = inp.add((oy * stride_h + ky) * in_row_stride + ox * stride_w * c);
+                    for kx in 0..kw {
+                        std::ptr::copy_nonoverlapping(src_row.add(kx * c), dst, c);
+                        dst = dst.add(c);
+                    }
                 }
             }
         }
+        debug_assert_eq!(dst.offset_from(col.as_ptr()) as usize, out_h * out_w * k);
+    }
+}
+
+/// im2col for a tile of output rows `[row_start .. row_start + tile_rows]`.
+/// Uses unsafe pointer arithmetic for tight inner loops.
+#[allow(unsafe_code)]
+fn im2col_nhwc_tile(
+    input: &[f32],
+    in_w: usize,
+    c: usize,
+    kh: usize,
+    kw: usize,
+    stride_h: usize,
+    stride_w: usize,
+    out_w: usize,
+    row_start: usize,
+    tile_rows: usize,
+    col: &mut [f32],
+) {
+    let k = kh * kw * c;
+    let in_row_stride = in_w * c;
+    // SAFETY: all input indices are in-bounds (no padding case).
+    unsafe {
+        let inp = input.as_ptr();
+        let mut dst = col.as_mut_ptr();
+        for local_row in 0..tile_rows {
+            let global_row = row_start + local_row;
+            let oy = global_row / out_w;
+            let ox = global_row % out_w;
+            for ky in 0..kh {
+                let src_row = inp.add((oy * stride_h + ky) * in_row_stride + ox * stride_w * c);
+                for kx in 0..kw {
+                    std::ptr::copy_nonoverlapping(src_row.add(kx * c), dst, c);
+                    dst = dst.add(c);
+                }
+            }
+        }
+        debug_assert_eq!(dst.offset_from(col.as_ptr()) as usize, tile_rows * k);
     }
 }
 
@@ -1591,6 +1662,10 @@ fn im2col_nhwc(
 /// im2col matrix: [M, K] where M = out_h*out_w, K = kH*kW*C_in
 /// kernel (already contiguous in NHWC): [K, N] where N = C_out
 /// output: [M, N] which maps directly to [1, out_h, out_w, C_out]
+///
+/// For large spatial outputs, tiles along M and runs tiles in parallel via
+/// rayon.  Each tile materialises only its own im2col slice, keeping the
+/// working set in L2 cache (~2 MB per thread).
 #[cfg(feature = "blas")]
 fn conv2d_im2col_gemm(
     plan: &Conv2dPlan,
@@ -1604,40 +1679,497 @@ fn conv2d_im2col_gemm(
     let m = out_h * out_w;
     let n = plan.out_channels;
 
-    // Build im2col matrix. No padding needed since build_conv2d_plan computes
-    // output dimensions without padding and the kernel is guaranteed to fit.
-    // SAFETY: im2col_nhwc writes every element of `col` before it is read.
-    #[allow(unsafe_code)]
-    let mut col = AlignedVec::<f32>::uninitialized(m * k);
-    im2col_nhwc(
-        input,
-        plan.in_w,
-        plan.in_channels,
-        plan.kernel_h,
-        plan.kernel_w,
-        plan.stride_h,
-        plan.stride_w,
-        out_h,
-        out_w,
-        &mut col,
-    );
+    // For 1×1 conv with stride 1, input IS the im2col matrix — zero-copy.
+    if plan.kernel_h == 1 && plan.kernel_w == 1 && plan.stride_h == 1 && plan.stride_w == 1 {
+        // SAFETY: blas_sgemm with beta=0 writes every element of `output`.
+        #[allow(unsafe_code)]
+        let mut output = AlignedVec::<f32>::uninitialized(m * n);
+        super::matmul::blas_sgemm(&input[..m * k], kernel, &mut output, m, k, n);
+        if let Some(bias) = bias {
+            add_bias_nhwc(&mut output, bias, m, n);
+        }
+        return Tensor::from_aligned(vec![1, out_h, out_w, n], output).map_err(Into::into);
+    }
 
-    // GEMM: col[m, k] @ kernel[k, n] -> output[m, n]
-    // blas_sgemm uses beta=0, so C is overwritten — no zeroing needed.
-    // SAFETY: blas_sgemm with beta=0 writes every element of `output`.
+    // Tile size: keep im2col_tile + output_tile in ~2 MB per thread.
+    // M1: 12 MB shared L2 across 4 P-cores, ~3 MB effective per core.
+    let bytes_per_row = (k + n) * std::mem::size_of::<f32>();
+    let tile_m = if bytes_per_row > 0 {
+        ((2 * 1024 * 1024) / bytes_per_row).max(1).min(m)
+    } else {
+        m
+    };
+
+    // SAFETY: every element is written by blas_sgemm (beta=0) + bias add.
     #[allow(unsafe_code)]
     let mut output = AlignedVec::<f32>::uninitialized(m * n);
-    super::matmul::blas_sgemm(&col, kernel, &mut output, m, k, n);
 
-    // Add bias
-    if let Some(bias) = bias {
-        for row in 0..m {
-            let row_off = row * n;
-            for c in 0..n {
-                output[row_off + c] += bias[c];
-            }
+    if m > tile_m * 2 {
+        // ── Parallel tiled im2col + GEMM ──────────────────────────────
+        // Each rayon thread reuses a thread-local im2col buffer across
+        // Conv calls to avoid repeated allocation/deallocation.
+        let out_slice: &mut [f32] = &mut output;
+        out_slice
+            .par_chunks_mut(tile_m * n)
+            .enumerate()
+            .for_each(|(tile_idx, out_chunk)| {
+                let row_start = tile_idx * tile_m;
+                let actual_m = out_chunk.len() / n;
+                if actual_m == 0 {
+                    return;
+                }
+                thread_local! {
+                    static COL_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+                }
+                COL_BUF.with(|cell| {
+                    let mut col_buf = cell.borrow_mut();
+                    let needed = actual_m * k;
+                    if col_buf.len() < needed {
+                        col_buf.resize(needed, 0.0);
+                    }
+                    im2col_nhwc_tile(
+                        input,
+                        plan.in_w,
+                        plan.in_channels,
+                        plan.kernel_h,
+                        plan.kernel_w,
+                        plan.stride_h,
+                        plan.stride_w,
+                        out_w,
+                        row_start,
+                        actual_m,
+                        &mut col_buf[..needed],
+                    );
+                    super::matmul::blas_sgemm(&col_buf[..needed], kernel, out_chunk, actual_m, k, n);
+                    if let Some(bias) = bias {
+                        add_bias_nhwc(out_chunk, bias, actual_m, n);
+                    }
+                });
+            });
+    } else {
+        // ── Single tile — small spatial ───────────────────────────────
+        thread_local! {
+            static MAIN_COL_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        MAIN_COL_BUF.with(|cell| {
+            let mut col_buf = cell.borrow_mut();
+            let needed = m * k;
+            if col_buf.len() < needed {
+                col_buf.resize(needed, 0.0);
+            }
+            im2col_nhwc(
+                input,
+                plan.in_w,
+                plan.in_channels,
+                plan.kernel_h,
+                plan.kernel_w,
+                plan.stride_h,
+                plan.stride_w,
+                out_h,
+                out_w,
+                &mut col_buf[..needed],
+            );
+            super::matmul::blas_sgemm(&col_buf[..needed], kernel, &mut output, m, k, n);
+            if let Some(bias) = bias {
+                add_bias_nhwc(&mut output, bias, m, n);
+            }
+        });
     }
 
     Tensor::from_aligned(vec![1, out_h, out_w, n], output).map_err(Into::into)
+}
+
+/// Add per-channel bias to NHWC output: output[row, c] += bias[c].
+/// Uses unsafe pointer arithmetic to avoid bounds-check overhead in the inner loop.
+#[allow(unsafe_code)]
+fn add_bias_nhwc(output: &mut [f32], bias: &[f32], m: usize, n: usize) {
+    debug_assert!(output.len() >= m * n);
+    debug_assert!(bias.len() >= n);
+    // SAFETY: m*n <= output.len(), n <= bias.len() verified by callers.
+    unsafe {
+        let out_ptr = output.as_mut_ptr();
+        let bias_ptr = bias.as_ptr();
+        for row in 0..m {
+            let row_ptr = out_ptr.add(row * n);
+            for c in 0..n {
+                *row_ptr.add(c) += *bias_ptr.add(c);
+            }
+        }
+    }
+}
+
+/// Fused bias + SiLU in a single SIMD pass: output[i] = silu(output[i] + bias[i%n]).
+/// Saves one full read+write pass over the output tile compared to separate
+/// add_bias_nhwc + silu_slice_inplace calls.
+#[inline]
+fn add_bias_silu_nhwc(output: &mut [f32], bias: &[f32], m: usize, n: usize) {
+    super::simd::bias_silu_nhwc_dispatch(output, bias, m, n);
+}
+
+/// Conv2D with implicit zero-padding — avoids separate padded tensor allocation.
+///
+/// `input` is NHWC `[batch, H, W, C_in]` (unpadded).
+/// `kernel` is `[KH, KW, C_in, C_out]`.
+/// Padding is applied virtually during im2col: out-of-bounds reads yield 0.
+#[cfg(feature = "blas")]
+pub fn conv2d_nhwc_padded(
+    input: &Tensor,
+    kernel: &Tensor,
+    bias: Option<&Tensor>,
+    stride_h: usize,
+    stride_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+    activation: Activation,
+) -> Result<Tensor, KernelError> {
+    let in_shape = input.shape();
+    if in_shape.len() != 4 || kernel.shape().len() != 4 {
+        return Err(KernelError::InvalidConvRank {
+            input_rank: in_shape.len(),
+            kernel_rank: kernel.shape().len(),
+        });
+    }
+    let (batch, in_h, in_w, c_in) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
+    let k_shape = kernel.shape();
+    let (kh, kw, _k_cin, c_out) = (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
+
+    let padded_h = in_h + pad_top + pad_bottom;
+    let padded_w = in_w + pad_left + pad_right;
+    let out_h = (padded_h - kh) / stride_h + 1;
+    let out_w = (padded_w - kw) / stride_w + 1;
+    let m = out_h * out_w;
+    let k = kh * kw * c_in;
+    let n = c_out;
+
+    let in_data = input.data();
+    let kernel_data = kernel.data();
+    let bias_data = bias.map(|b| b.data());
+
+    // Winograd F(2×2,3×3): disabled. Apple Accelerate's AMX-backed sgemm is so
+    // efficient for large GEMMs that Winograd's 16 smaller GEMMs (K=c_in vs
+    // K=9·c_in) lose more in BLAS efficiency than they gain in FLOPs.
+    // Keep the implementation for non-Apple BLAS where Winograd may win.
+
+    // Tile size: keep im2col_tile + output_tile in ~2 MB per thread.
+    let bytes_per_row = (k + n) * std::mem::size_of::<f32>();
+    let tile_m = if bytes_per_row > 0 {
+        ((2 * 1024 * 1024) / bytes_per_row).max(1).min(m)
+    } else {
+        m
+    };
+
+    // SAFETY: every element is written by blas_sgemm (beta=0) + bias add.
+    #[allow(unsafe_code)]
+    let mut output = AlignedVec::<f32>::uninitialized(batch * m * n);
+
+    for b in 0..batch {
+        let in_slice = &in_data[b * in_h * in_w * c_in..(b + 1) * in_h * in_w * c_in];
+        let out_batch = &mut output[b * m * n..(b + 1) * m * n];
+
+        if m > tile_m * 2 {
+            // Parallel tiled im2col + GEMM
+            out_batch
+                .par_chunks_mut(tile_m * n)
+                .enumerate()
+                .for_each(|(tile_idx, out_chunk)| {
+                    let row_start = tile_idx * tile_m;
+                    let actual_m = out_chunk.len() / n;
+                    if actual_m == 0 {
+                        return;
+                    }
+                    thread_local! {
+                        static PAD_COL_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+                    }
+                    PAD_COL_BUF.with(|cell| {
+                        let mut col_buf = cell.borrow_mut();
+                        let needed = actual_m * k;
+                        if col_buf.len() < needed {
+                            col_buf.resize(needed, 0.0);
+                        }
+                        im2col_nhwc_padded_tile(
+                            in_slice,
+                            in_h,
+                            in_w,
+                            c_in,
+                            kh,
+                            kw,
+                            stride_h,
+                            stride_w,
+                            pad_top,
+                            pad_left,
+                            out_w,
+                            row_start,
+                            actual_m,
+                            &mut col_buf[..needed],
+                        );
+                        super::matmul::blas_sgemm(
+                            &col_buf[..needed],
+                            kernel_data,
+                            out_chunk,
+                            actual_m,
+                            k,
+                            n,
+                        );
+                        match (bias_data, activation) {
+                            (Some(bd), Activation::Silu) => {
+                                add_bias_silu_nhwc(out_chunk, bd, actual_m, n);
+                            }
+                            (Some(bd), _) => add_bias_nhwc(out_chunk, bd, actual_m, n),
+                            (None, Activation::Silu) => silu_slice_inplace(out_chunk),
+                            (None, _) => {}
+                        }
+                    });
+                });
+        } else {
+            // Single tile
+            thread_local! {
+                static MAIN_PAD_COL_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            MAIN_PAD_COL_BUF.with(|cell| {
+                let mut col_buf = cell.borrow_mut();
+                let needed = m * k;
+                if col_buf.len() < needed {
+                    col_buf.resize(needed, 0.0);
+                }
+                im2col_nhwc_padded(
+                    in_slice,
+                    in_h,
+                    in_w,
+                    c_in,
+                    kh,
+                    kw,
+                    stride_h,
+                    stride_w,
+                    pad_top,
+                    pad_left,
+                    out_h,
+                    out_w,
+                    &mut col_buf[..needed],
+                );
+                super::matmul::blas_sgemm(&col_buf[..needed], kernel_data, out_batch, m, k, n);
+                match (bias_data, activation) {
+                    (Some(bd), Activation::Silu) => {
+                        add_bias_silu_nhwc(out_batch, bd, m, n);
+                    }
+                    (Some(bd), _) => add_bias_nhwc(out_batch, bd, m, n),
+                    (None, Activation::Silu) => silu_slice_inplace(out_batch),
+                    (None, _) => {}
+                }
+            });
+        }
+    }
+
+    Tensor::from_aligned(vec![batch, out_h, out_w, n], output).map_err(Into::into)
+}
+
+/// im2col with implicit zero-padding.  Out-of-bounds input reads are zero.
+///
+/// Interior optimization: for output rows where ALL kernel positions fall
+/// within the valid input region, we skip per-element bounds checks entirely.
+/// This covers ~90%+ of output positions for typical 3×3 pad=1 convolutions.
+#[allow(unsafe_code)]
+fn im2col_nhwc_padded(
+    input: &[f32],
+    in_h: usize,
+    in_w: usize,
+    c: usize,
+    kh: usize,
+    kw: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    out_h: usize,
+    out_w: usize,
+    col: &mut [f32],
+) {
+    let k = kh * kw * c;
+    // Compute the range of output rows/cols where ALL kernel taps are valid.
+    // Interior: oy where oy*stride_h >= pad_top and oy*stride_h + kh - 1 < in_h + pad_top
+    //   → oy >= ceil(pad_top / stride_h) and oy <= (in_h + pad_top - kh) / stride_h
+    let oy_start = if pad_top > 0 {
+        pad_top.div_ceil(stride_h)
+    } else {
+        0
+    };
+    let oy_end = if in_h + pad_top >= kh {
+        (in_h + pad_top - kh) / stride_h + 1
+    } else {
+        0
+    }
+    .min(out_h);
+    let ox_start = if pad_left > 0 {
+        pad_left.div_ceil(stride_w)
+    } else {
+        0
+    };
+    let ox_end = if in_w + pad_left >= kw {
+        (in_w + pad_left - kw) / stride_w + 1
+    } else {
+        0
+    }
+    .min(out_w);
+
+    let in_row_stride = in_w * c;
+
+    for oy in 0..out_h {
+        let base_iy = oy * stride_h;
+        let is_interior_y = oy >= oy_start && oy < oy_end;
+
+        for ox in 0..out_w {
+            let row_off = (oy * out_w + ox) * k;
+
+            if is_interior_y && ox >= ox_start && ox < ox_end {
+                // Interior: all kernel taps are valid — no bounds checks.
+                let base_ix = ox * stride_w - pad_left;
+                let base_iy_val = base_iy - pad_top;
+                // SAFETY: we verified all (iy, ix) are in-bounds above.
+                unsafe {
+                    let mut dst = col.as_mut_ptr().add(row_off);
+                    if stride_w == 1 {
+                        // When stride_w==1, kernel taps along x are contiguous in NHWC
+                        // layout, so we copy kw*c floats per kernel row instead of kw
+                        // separate copies. For 3×3: 3 memcpys instead of 9.
+                        let row_bytes = kw * c;
+                        for ky in 0..kh {
+                            let src_row = input
+                                .as_ptr()
+                                .add((base_iy_val + ky) * in_row_stride + base_ix * c);
+                            std::ptr::copy_nonoverlapping(src_row, dst, row_bytes);
+                            dst = dst.add(row_bytes);
+                        }
+                    } else {
+                        for ky in 0..kh {
+                            let src_row = input
+                                .as_ptr()
+                                .add((base_iy_val + ky) * in_row_stride + base_ix * c);
+                            for kx in 0..kw {
+                                std::ptr::copy_nonoverlapping(src_row.add(kx * c), dst, c);
+                                dst = dst.add(c);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Border: some taps may be out of bounds.
+                for ky in 0..kh {
+                    let iy = (base_iy + ky) as isize - pad_top as isize;
+                    for kx in 0..kw {
+                        let ix = (ox * stride_w + kx) as isize - pad_left as isize;
+                        let dst_off = row_off + (ky * kw + kx) * c;
+                        if iy >= 0 && (iy as usize) < in_h && ix >= 0 && (ix as usize) < in_w {
+                            let src_off = (iy as usize * in_w + ix as usize) * c;
+                            col[dst_off..dst_off + c].copy_from_slice(&input[src_off..src_off + c]);
+                        } else {
+                            col[dst_off..dst_off + c].fill(0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Tiled im2col with implicit padding — handles out-of-bounds as zero.
+/// Same interface as `im2col_nhwc_tile` but with padding parameters.
+///
+/// Uses interior/border split: for output positions where all kernel taps
+/// fall within valid input, skips bounds checks entirely via unsafe ptrs.
+#[allow(unsafe_code)]
+fn im2col_nhwc_padded_tile(
+    input: &[f32],
+    in_h: usize,
+    in_w: usize,
+    c: usize,
+    kh: usize,
+    kw: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    out_w: usize,
+    row_start: usize,
+    tile_rows: usize,
+    col: &mut [f32],
+) {
+    let k = kh * kw * c;
+    let in_row_stride = in_w * c;
+
+    // Interior bounds (same computation as non-tiled version).
+    let oy_start = if pad_top > 0 {
+        pad_top.div_ceil(stride_h)
+    } else {
+        0
+    };
+    let oy_end_val = if in_h + pad_top >= kh {
+        (in_h + pad_top - kh) / stride_h + 1
+    } else {
+        0
+    };
+    let ox_start = if pad_left > 0 {
+        pad_left.div_ceil(stride_w)
+    } else {
+        0
+    };
+    let ox_end = if in_w + pad_left >= kw {
+        (in_w + pad_left - kw) / stride_w + 1
+    } else {
+        0
+    }
+    .min(out_w);
+
+    for local_row in 0..tile_rows {
+        let global_row = row_start + local_row;
+        let oy = global_row / out_w;
+        let ox = global_row % out_w;
+        let row_off = local_row * k;
+
+        let is_interior = oy >= oy_start && oy < oy_end_val && ox >= ox_start && ox < ox_end;
+
+        if is_interior {
+            let base_iy = oy * stride_h - pad_top;
+            let base_ix = ox * stride_w - pad_left;
+            // SAFETY: interior guarantees all (iy, ix) are in-bounds.
+            unsafe {
+                let mut dst = col.as_mut_ptr().add(row_off);
+                if stride_w == 1 {
+                    let row_bytes = kw * c;
+                    for ky in 0..kh {
+                        let src_row = input
+                            .as_ptr()
+                            .add((base_iy + ky) * in_row_stride + base_ix * c);
+                        std::ptr::copy_nonoverlapping(src_row, dst, row_bytes);
+                        dst = dst.add(row_bytes);
+                    }
+                } else {
+                    for ky in 0..kh {
+                        let src_row = input
+                            .as_ptr()
+                            .add((base_iy + ky) * in_row_stride + base_ix * c);
+                        for kx in 0..kw {
+                            std::ptr::copy_nonoverlapping(src_row.add(kx * c), dst, c);
+                            dst = dst.add(c);
+                        }
+                    }
+                }
+            }
+        } else {
+            let base_iy = oy * stride_h;
+            for ky in 0..kh {
+                let iy = (base_iy + ky) as isize - pad_top as isize;
+                for kx in 0..kw {
+                    let ix = (ox * stride_w + kx) as isize - pad_left as isize;
+                    let dst_off = row_off + (ky * kw + kx) * c;
+                    if iy >= 0 && (iy as usize) < in_h && ix >= 0 && (ix as usize) < in_w {
+                        let src_off = (iy as usize * in_w + ix as usize) * c;
+                        col[dst_off..dst_off + c].copy_from_slice(&input[src_off..src_off + c]);
+                    } else {
+                        col[dst_off..dst_off + c].fill(0.0);
+                    }
+                }
+            }
+        }
+    }
 }

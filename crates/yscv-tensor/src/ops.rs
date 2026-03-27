@@ -643,6 +643,219 @@ impl Tensor {
             shape_element_count(&out_shape).ok_or_else(|| TensorError::SizeOverflow {
                 shape: out_shape.clone(),
             })?;
+
+        // ── Fast path: tiled 2D transpose for common 4D permutations ──
+        // Uses unsafe pointer arithmetic to eliminate bounds checks in hot inner loops.
+        // NHWC→NCHW [0,3,1,2]: transpose inner [H*W, C] → [C, H*W]
+        if rank == 4 && axes == [0, 3, 1, 2] {
+            let (n, h, w, c) = (src_shape[0], src_shape[1], src_shape[2], src_shape[3]);
+            let hw = h * w;
+            let src = self.data();
+            let mut dst = AlignedVec::<f32>::uninitialized(out_count);
+            const TILE: usize = 32;
+            #[allow(unsafe_code)]
+            unsafe {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_mut_ptr();
+                for batch in 0..n {
+                    let s_base = src_ptr.add(batch * hw * c);
+                    let d_base = dst_ptr.add(batch * c * hw);
+                    for i0 in (0..hw).step_by(TILE) {
+                        let ie = (i0 + TILE).min(hw);
+                        for j0 in (0..c).step_by(TILE) {
+                            let je = (j0 + TILE).min(c);
+                            for i in i0..ie {
+                                let s_row = s_base.add(i * c);
+                                for j in j0..je {
+                                    *d_base.add(j * hw + i) = *s_row.add(j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Tensor::from_aligned(out_shape, dst);
+        }
+        // NCHW→NHWC [0,2,3,1]: transpose inner [C, H*W] → [H*W, C]
+        if rank == 4 && axes == [0, 2, 3, 1] {
+            let (n, c, h, w) = (src_shape[0], src_shape[1], src_shape[2], src_shape[3]);
+            let hw = h * w;
+            let src = self.data();
+            let mut dst = AlignedVec::<f32>::uninitialized(out_count);
+            const TILE: usize = 32;
+            #[allow(unsafe_code)]
+            unsafe {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_mut_ptr();
+                for batch in 0..n {
+                    let s_base = src_ptr.add(batch * c * hw);
+                    let d_base = dst_ptr.add(batch * hw * c);
+                    for i0 in (0..c).step_by(TILE) {
+                        let ie = (i0 + TILE).min(c);
+                        for j0 in (0..hw).step_by(TILE) {
+                            let je = (j0 + TILE).min(hw);
+                            for i in i0..ie {
+                                let s_row = s_base.add(i * hw);
+                                for j in j0..je {
+                                    *d_base.add(j * c + i) = *s_row.add(j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Tensor::from_aligned(out_shape, dst);
+        }
+        // 3D swap last two dims [0,2,1]: transpose [A, B, C] → [A, C, B]
+        if rank == 3 && axes == [0, 2, 1] {
+            let (a, b, c) = (src_shape[0], src_shape[1], src_shape[2]);
+            let src = self.data();
+            let mut dst = AlignedVec::<f32>::uninitialized(out_count);
+            const TILE: usize = 32;
+            #[allow(unsafe_code)]
+            unsafe {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_mut_ptr();
+                for batch in 0..a {
+                    let s_base = src_ptr.add(batch * b * c);
+                    let d_base = dst_ptr.add(batch * c * b);
+                    for i0 in (0..b).step_by(TILE) {
+                        let ie = (i0 + TILE).min(b);
+                        for j0 in (0..c).step_by(TILE) {
+                            let je = (j0 + TILE).min(c);
+                            for i in i0..ie {
+                                let s_row = s_base.add(i * c);
+                                for j in j0..je {
+                                    *d_base.add(j * b + i) = *s_row.add(j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Tensor::from_aligned(out_shape, dst);
+        }
+
+        // [0,1,3,2]: swap last two dims in 4D → [N, A, C, B]
+        // For each (n, a), tiled 2D transpose of [B, C] → [C, B].
+        if rank == 4 && axes == [0, 1, 3, 2] {
+            let (nn, a, b, c) = (src_shape[0], src_shape[1], src_shape[2], src_shape[3]);
+            let src = self.data();
+            let mut dst = AlignedVec::<f32>::uninitialized(out_count);
+            const TILE: usize = 32;
+            #[allow(unsafe_code)]
+            unsafe {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_mut_ptr();
+                for n in 0..nn {
+                    for aa in 0..a {
+                        let base = (n * a + aa) * b * c;
+                        let s_base = src_ptr.add(base);
+                        let d_base = dst_ptr.add(base); // same offset, different shape
+                        for i0 in (0..b).step_by(TILE) {
+                            let ie = (i0 + TILE).min(b);
+                            for j0 in (0..c).step_by(TILE) {
+                                let je = (j0 + TILE).min(c);
+                                for i in i0..ie {
+                                    let s_row = s_base.add(i * c);
+                                    for j in j0..je {
+                                        *d_base.add(j * b + i) = *s_row.add(j);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Tensor::from_aligned(out_shape, dst);
+        }
+        // [0,2,1,3]: swap dims 1↔2 in 4D → [N, B, A, C]
+        // Each element in the swap is a contiguous block of C floats — use memcpy.
+        if rank == 4 && axes == [0, 2, 1, 3] {
+            let (nn, a, b, c) = (src_shape[0], src_shape[1], src_shape[2], src_shape[3]);
+            let src = self.data();
+            let mut dst = AlignedVec::<f32>::uninitialized(out_count);
+            #[allow(unsafe_code)]
+            unsafe {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_mut_ptr();
+                for n in 0..nn {
+                    let s_batch = src_ptr.add(n * a * b * c);
+                    let d_batch = dst_ptr.add(n * b * a * c);
+                    for aa in 0..a {
+                        for bb in 0..b {
+                            std::ptr::copy_nonoverlapping(
+                                s_batch.add(aa * b * c + bb * c),
+                                d_batch.add(bb * a * c + aa * c),
+                                c,
+                            );
+                        }
+                    }
+                }
+            }
+            return Tensor::from_aligned(out_shape, dst);
+        }
+        // [0,3,2,1]: swap dims 1↔3 in 4D → [N, D, B, A]
+        // For each (n, b), tiled 2D transpose of [A, D] → [D, A] with strides.
+        if rank == 4 && axes == [0, 3, 2, 1] {
+            let (nn, a, b, d) = (src_shape[0], src_shape[1], src_shape[2], src_shape[3]);
+            let src = self.data();
+            let mut dst = AlignedVec::<f32>::uninitialized(out_count);
+            let src_a_stride = b * d;
+            let dst_d_stride = b * a;
+            const TILE: usize = 32;
+            #[allow(unsafe_code)]
+            unsafe {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_mut_ptr();
+                for n in 0..nn {
+                    for bb in 0..b {
+                        let s_base = src_ptr.add(n * a * b * d + bb * d);
+                        let d_base = dst_ptr.add(n * d * b * a + bb * a);
+                        for i0 in (0..a).step_by(TILE) {
+                            let ie = (i0 + TILE).min(a);
+                            for j0 in (0..d).step_by(TILE) {
+                                let je = (j0 + TILE).min(d);
+                                for i in i0..ie {
+                                    for j in j0..je {
+                                        *d_base.add(j * dst_d_stride + i) =
+                                            *s_base.add(i * src_a_stride + j);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Tensor::from_aligned(out_shape, dst);
+        }
+        // 2D transpose [1,0]: swap rows and cols
+        if rank == 2 && axes == [1, 0] {
+            let (rows, cols) = (src_shape[0], src_shape[1]);
+            let src = self.data();
+            let mut dst = AlignedVec::<f32>::uninitialized(out_count);
+            const TILE: usize = 32;
+            #[allow(unsafe_code)]
+            unsafe {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_mut_ptr();
+                for i0 in (0..rows).step_by(TILE) {
+                    let ie = (i0 + TILE).min(rows);
+                    for j0 in (0..cols).step_by(TILE) {
+                        let je = (j0 + TILE).min(cols);
+                        for i in i0..ie {
+                            let s_row = src_ptr.add(i * cols);
+                            for j in j0..je {
+                                *dst_ptr.add(j * rows + i) = *s_row.add(j);
+                            }
+                        }
+                    }
+                }
+            }
+            return Tensor::from_aligned(out_shape, dst);
+        }
+
+        // ── General fallback: coordinate-based scatter ──
         let out_strides = compute_strides(&out_shape).ok_or_else(|| TensorError::SizeOverflow {
             shape: out_shape.clone(),
         })?;
@@ -732,18 +945,40 @@ impl Tensor {
 
         let outer: usize = out_shape[..axis].iter().product();
         let inner: usize = out_shape[axis + 1..].iter().product();
-        let mut out_data = Vec::with_capacity(out_count);
 
-        for o in 0..outer {
-            for t in tensors {
-                let t_axis_len = t.shape()[axis];
-                let chunk_start = o * t_axis_len * inner;
-                let chunk_end = chunk_start + t_axis_len * inner;
-                out_data.extend_from_slice(&t.data()[chunk_start..chunk_end]);
+        // Write directly into AlignedVec to avoid the double-copy through
+        // Vec -> AlignedVec::from_vec.
+        let mut out_data = AlignedVec::<f32>::uninitialized(out_count);
+
+        if inner == 1 && tensors.len() <= 8 {
+            // Last-axis concat: write entire output in outer-major order.
+            let axis_lens: Vec<usize> = tensors.iter().map(|t| t.shape()[axis]).collect();
+            let dst = out_data.as_mut_slice();
+            let mut dst_off = 0;
+            for o in 0..outer {
+                for (ti, t) in tensors.iter().enumerate() {
+                    let al = axis_lens[ti];
+                    let src_off = o * al;
+                    dst[dst_off..dst_off + al].copy_from_slice(&t.data()[src_off..src_off + al]);
+                    dst_off += al;
+                }
+            }
+        } else {
+            let dst = out_data.as_mut_slice();
+            let mut dst_off = 0;
+            for o in 0..outer {
+                for t in tensors {
+                    let t_axis_len = t.shape()[axis];
+                    let chunk_len = t_axis_len * inner;
+                    let chunk_start = o * chunk_len;
+                    dst[dst_off..dst_off + chunk_len]
+                        .copy_from_slice(&t.data()[chunk_start..chunk_start + chunk_len]);
+                    dst_off += chunk_len;
+                }
             }
         }
 
-        Tensor::from_vec(out_shape, out_data)
+        Tensor::from_aligned(out_shape, out_data)
     }
 
     /// Stack tensors along a new axis. All tensors must have identical shapes.

@@ -19,7 +19,7 @@ yscv (umbrella re-export)
 ├── yscv-recognize       ← cosine matching, VP-Tree ANN
 ├── yscv-track           ← DeepSORT, ByteTrack, Kalman, re-id
 ├── yscv-eval            ← 41 metrics, 11 dataset formats
-├── yscv-onnx            ← 91+ op ONNX runtime, quantization, graph optimizer
+├── yscv-onnx            ← 128+ op ONNX runtime, quantization, graph optimizer, Metal GPU
 └── yscv-cli             ← CLI for inference, benchmarking, evaluation
 ```
 
@@ -29,7 +29,7 @@ yscv (umbrella re-export)
 |--------|-------|
 | Total Rust LOC | **140,260** |
 | .rs files | **397** |
-| Tests | **1,659** |
+| Tests | **1,678** |
 | SIMD functions | **295** (NEON + SSE + AVX) |
 | GPU WGSL shaders | **17** |
 | Benchmark operations | **100+** |
@@ -40,7 +40,7 @@ yscv (umbrella re-export)
 - **Release profile**: `lto = "thin"`, `codegen-units = 1`
 - **Target CPU flags**: `apple-m1` (macOS ARM), `neoverse-n1` (Linux ARM), `x86-64-v3` (AVX2)
 - **BLAS**: Accelerate (macOS), OpenBLAS (Linux/Windows)
-- **GPU**: wgpu compute shaders (Vulkan/Metal/DX12)
+- **GPU**: wgpu compute shaders (Vulkan/Metal/DX12) + Metal-native backend (`--features metal-backend`)
 
 ## SIMD strategy
 
@@ -53,14 +53,13 @@ All dispatch functions have `#[inline]` for cross-crate inlining.
 
 ## Performance vs competitors
 
-Across 100+ benchmarked operations against NumPy 2.0, PyTorch 2.8, and OpenCV 4.13 (Apple Silicon, best-of-100, March 2026):
+Across 100+ benchmarked operations against NumPy 2.0, PyTorch 2.8, OpenCV 4.13, onnxruntime 1.19, and Apple CoreML (Apple Silicon M3 Pro, March 2026):
 
-- **72 wins** — faster than all competitors
+- **77 wins** — faster than all competitors
 - **~4 parity** — within 10%
-- **0 close**
 - **0 losses**
 
-Key wins: sigmoid **6.0×** vs PyTorch, relu **6.2×** vs NumPy, resize nearest **3.3×** vs OpenCV, resize bilinear **3.0×** vs OpenCV, sobel u8 **2.3×** vs OpenCV, softmax **2.2×** vs PyTorch, layer_norm **1.8×** vs PyTorch (was parity, now WIN), batchnorm **1.6×** vs PyTorch.
+Key wins: sigmoid **6.0×** vs PyTorch, relu **6.2×** vs NumPy, resize nearest **3.3×** vs OpenCV, resize bilinear **3.0×** vs OpenCV, sobel u8 **2.3×** vs OpenCV, softmax **2.2×** vs PyTorch, ONNX CPU **3×** vs onnxruntime, Metal GPU **14% faster** than CoreML (11.8ms vs 13.4ms — CoreML uses dedicated Neural Engine hardware). YOLO11n: only runtime that runs it (CPU + GPU), competitors all fail.
 
 ## Framework features
 
@@ -74,7 +73,7 @@ Key wins: sigmoid **6.0×** vs PyTorch, relu **6.2×** vs NumPy, resize nearest 
 
 ## Testing and CI
 
-- **1,659 tests** across the workspace
+- **1,678 tests** across the workspace
 - CI: GitHub Actions on Ubuntu/macOS/Windows + ARM64 Linux
 - Quality gates: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace --release`
 

@@ -18,11 +18,35 @@ pub(super) fn exec_flatten(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), O
 }
 
 pub(super) fn exec_reshape(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
-    let input = get_tensor(env, &node.name, &node.inputs[0])?;
-    let shape_tensor = get_tensor(env, &node.name, &node.inputs[1])?;
-    let total = input.len();
-    let raw_dims: Vec<f32> = shape_tensor.data().to_vec();
-    let in_shape = input.shape().to_vec();
+    exec_reshape_inner(node, env, None)
+}
+
+/// Reshape with optional use-count awareness: when the data input has exactly
+/// one remaining consumer we can `remove` it from the environment and call
+/// `into_reshape` (zero-copy). Otherwise we fall back to a cloning `reshape`.
+pub(super) fn exec_reshape_zerocopy(
+    node: &OnnxNode,
+    env: &mut TensorEnv,
+    use_counts: &HashMap<&str, usize>,
+) -> Result<(), OnnxError> {
+    exec_reshape_inner(node, env, Some(use_counts))
+}
+
+fn exec_reshape_inner(
+    node: &OnnxNode,
+    env: &mut TensorEnv,
+    use_counts: Option<&HashMap<&str, usize>>,
+) -> Result<(), OnnxError> {
+    // Read metadata before taking ownership to compute new_shape.
+    let (total, in_shape, raw_dims) = {
+        let input = get_tensor(env, &node.name, &node.inputs[0])?;
+        let shape_tensor = get_tensor(env, &node.name, &node.inputs[1])?;
+        (
+            input.len(),
+            input.shape().to_vec(),
+            shape_tensor.data().to_vec(),
+        )
+    };
 
     let mut neg_idx = None;
     let mut new_shape = Vec::with_capacity(raw_dims.len());
@@ -48,16 +72,40 @@ pub(super) fn exec_reshape(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), O
         new_shape[idx] = if known > 0 { total / known } else { total };
     }
 
-    let out = input
-        .reshape(new_shape)
-        .map_err(|e| OnnxError::DecodeFailed {
-            message: e.to_string(),
-        })?;
-    env.insert(node.outputs[0].clone(), out);
+    // Zero-copy path: remove the tensor from env (avoiding a data clone)
+    // only when this node is the sole remaining consumer.
+    let sole_consumer = use_counts
+        .map(|uc| uc.get(node.inputs[0].as_str()).copied().unwrap_or(0) <= 1)
+        .unwrap_or(false);
+
+    if sole_consumer {
+        let input = env
+            .remove(&node.inputs[0])
+            .or_else(|| env.get(&node.inputs[0]).cloned())
+            .ok_or_else(|| OnnxError::MissingInput {
+                node: node.name.clone(),
+                input: node.inputs[0].clone(),
+            })?;
+        let out = input
+            .into_reshape(new_shape)
+            .map_err(|e| OnnxError::DecodeFailed {
+                message: e.to_string(),
+            })?;
+        env.insert(node.outputs[0].clone(), out);
+    } else {
+        let input = get_tensor(env, &node.name, &node.inputs[0])?;
+        let out = input
+            .reshape(new_shape)
+            .map_err(|e| OnnxError::DecodeFailed {
+                message: e.to_string(),
+            })?;
+        env.insert(node.outputs[0].clone(), out);
+    }
     Ok(())
 }
 
 pub(super) fn exec_transpose(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
+    let input_is_nhwc = env.is_nhwc(&node.inputs[0]);
     let input = get_tensor(env, &node.name, &node.inputs[0])?;
     let perm = get_attr_ints(node, "perm");
 
@@ -65,6 +113,41 @@ pub(super) fn exec_transpose(node: &OnnxNode, env: &mut TensorEnv) -> Result<(),
         Some(p) => p.iter().map(|&v| v as usize).collect(),
         None => (0..input.rank()).rev().collect(),
     };
+
+    // ── NHWC-aware fast path for 4D tensors ──
+    // When the input is physically NHWC but the model assumes NCHW, the model's
+    // perm operates on NCHW indices.  Normally we'd do ensure_nchw (perm Q=[0,3,1,2])
+    // then model's perm P — two physical transposes.  Instead we compose them into
+    // a single effective perm C[k] = Q[P[k]].  If C is identity, no data movement
+    // is needed at all.
+    if input_is_nhwc && input.rank() == 4 && axes.len() == 4 {
+        // Q = ensure_nchw perm: maps NHWC physical to NCHW.
+        const Q: [usize; 4] = [0, 3, 1, 2];
+        let composed = [Q[axes[0]], Q[axes[1]], Q[axes[2]], Q[axes[3]]];
+
+        if composed == [0, 1, 2, 3] {
+            // Identity — zero-copy: just move the tensor to the output slot.
+            // The model's output shape matches the physical NHWC shape, so we
+            // do NOT mark the output as NHWC (the model already expects this shape).
+            if let Some(tensor) = env.remove(&node.inputs[0]) {
+                env.insert(node.outputs[0].clone(), tensor);
+            }
+            return Ok(());
+        }
+
+        // Non-identity composed perm: apply a single permute on the physical data.
+        let out = input
+            .permute(composed.as_ref())
+            .map_err(|e| OnnxError::DecodeFailed {
+                message: e.to_string(),
+            })?;
+        env.insert(node.outputs[0].clone(), out);
+        // If the composed perm is NCHW→NHWC, mark output as NHWC.
+        if composed == [0, 2, 3, 1] {
+            env.mark_nhwc(&node.outputs[0]);
+        }
+        return Ok(());
+    }
 
     let out = input.permute(&axes).map_err(|e| OnnxError::DecodeFailed {
         message: e.to_string(),
@@ -75,25 +158,55 @@ pub(super) fn exec_transpose(node: &OnnxNode, env: &mut TensorEnv) -> Result<(),
 
 pub(super) fn exec_concat(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
     let axis = get_attr_int(node, "axis").unwrap_or(0);
-    let tensors: Vec<Tensor> = node
-        .inputs
-        .iter()
-        .filter(|name| !name.is_empty())
-        .map(|name| get_tensor(env, &node.name, name).cloned())
-        .collect::<Result<Vec<_>, _>>()?;
 
-    let refs: Vec<&Tensor> = tensors.iter().collect();
-    let rank = refs[0].rank();
-    let actual_axis = if axis < 0 {
-        (rank as i64 + axis) as usize
+    // Check if all 4D inputs are NHWC
+    let non_empty: Vec<&String> = node.inputs.iter().filter(|n| !n.is_empty()).collect();
+    let all_nhwc = non_empty.iter().all(|n| env.is_nhwc(n));
+    let any_4d = non_empty
+        .iter()
+        .any(|n| env.get(n.as_str()).is_some_and(|t| t.rank() == 4));
+
+    let (actual_axis, is_nhwc_output) = if all_nhwc && any_4d {
+        // All spatial inputs are NHWC — adjust axis
+        let rank = env
+            .get(non_empty[0].as_str())
+            .map(|t| t.rank())
+            .unwrap_or(4);
+        let raw_axis = if axis < 0 {
+            (rank as i64 + axis) as usize
+        } else {
+            axis as usize
+        };
+        (super::nchw_axis_to_nhwc(raw_axis), true)
     } else {
-        axis as usize
+        // Mixed or all NCHW — ensure all NCHW
+        for name in &non_empty {
+            super::ensure_nchw(env, name)?;
+        }
+        let rank = env
+            .get(non_empty[0].as_str())
+            .map(|t| t.rank())
+            .unwrap_or(4);
+        let raw_axis = if axis < 0 {
+            (rank as i64 + axis) as usize
+        } else {
+            axis as usize
+        };
+        (raw_axis, false)
     };
+
+    let refs: Vec<&Tensor> = non_empty
+        .iter()
+        .map(|name| get_tensor(env, &node.name, name))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let out = Tensor::cat(&refs, actual_axis).map_err(|e| OnnxError::DecodeFailed {
         message: e.to_string(),
     })?;
     env.insert(node.outputs[0].clone(), out);
+    if is_nhwc_output {
+        env.mark_nhwc(&node.outputs[0]);
+    }
     Ok(())
 }
 
@@ -170,8 +283,24 @@ pub(super) fn exec_squeeze(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), O
 }
 
 pub(super) fn exec_shape(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
+    let input_is_nhwc = env.is_nhwc(&node.inputs[0]);
     let input = get_tensor(env, &node.name, &node.inputs[0])?;
-    let shape_data: Vec<f32> = input.shape().iter().map(|&d| d as f32).collect();
+    let phys_shape = input.shape();
+
+    // If the tensor is physically NHWC, return the model's expected NCHW shape
+    // without performing an expensive data permutation.
+    let shape_data: Vec<f32> = if input_is_nhwc && phys_shape.len() == 4 {
+        // NHWC physical [N,H,W,C] → NCHW model [N,C,H,W]
+        vec![
+            phys_shape[0] as f32,
+            phys_shape[3] as f32,
+            phys_shape[1] as f32,
+            phys_shape[2] as f32,
+        ]
+    } else {
+        phys_shape.iter().map(|&d| d as f32).collect()
+    };
+
     let out = Tensor::from_vec(vec![shape_data.len()], shape_data).map_err(|e| {
         OnnxError::DecodeFailed {
             message: e.to_string(),
@@ -190,14 +319,27 @@ fn equal_split(dim: usize, num_outputs: usize) -> Vec<usize> {
 }
 
 pub(super) fn exec_split(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
-    let input = get_tensor(env, &node.name, &node.inputs[0])?.clone();
+    let input_is_nhwc = env.is_nhwc(&node.inputs[0]);
+    // Take ownership to avoid cloning the entire tensor.
+    let input = env
+        .remove(&node.inputs[0])
+        .or_else(|| get_tensor(env, &node.name, &node.inputs[0]).ok().cloned())
+        .ok_or_else(|| OnnxError::MissingInput {
+            node: node.name.clone(),
+            input: node.inputs[0].clone(),
+        })?;
     let axis = get_attr_int(node, "axis").unwrap_or(0);
     let shape = input.shape();
     let rank = shape.len();
-    let axis_usize = if axis < 0 {
+    let raw_axis = if axis < 0 {
         (rank as i64 + axis) as usize
     } else {
         axis as usize
+    };
+    let axis_usize = if input_is_nhwc && rank == 4 {
+        super::nchw_axis_to_nhwc(raw_axis)
+    } else {
+        raw_axis
     };
     let dim = shape[axis_usize];
     let num_outputs = node.outputs.len();
@@ -217,35 +359,45 @@ pub(super) fn exec_split(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), Onn
     };
 
     let data = input.data();
-    let strides = compute_strides(shape);
-    let mut offset_along_axis = 0;
+    // Fast block-copy split: O(outer_size) memcpys instead of O(total_elements) coordinate lookups.
+    let inner_size: usize = shape[axis_usize + 1..].iter().product::<usize>().max(1);
+    let outer_size: usize = shape[..axis_usize].iter().product::<usize>().max(1);
+    let axis_stride = dim * inner_size;
+
+    let mut offset_along_axis = 0usize;
+    #[allow(unsafe_code)]
+    let src_ptr = data.as_ptr();
     for (out_idx, &sz) in split_sizes.iter().enumerate() {
+        let block_size = sz * inner_size;
+        let total = outer_size * block_size;
+        let src_offset = offset_along_axis * inner_size;
+
+        let mut out_data = yscv_tensor::AlignedVec::<f32>::uninitialized(total);
+        #[allow(unsafe_code)]
+        unsafe {
+            let dst_ptr = out_data.as_mut_ptr();
+            for outer in 0..outer_size {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(outer * axis_stride + src_offset),
+                    dst_ptr.add(outer * block_size),
+                    block_size,
+                );
+            }
+        }
+
         let mut out_shape = shape.to_vec();
         out_shape[axis_usize] = sz;
-        let out_size: usize = out_shape.iter().product();
-        let mut out_data = Vec::with_capacity(out_size);
-        let out_strides = compute_strides(&out_shape);
-        for flat in 0..out_size {
-            let mut coords = vec![0usize; rank];
-            let mut r = flat;
-            for d in 0..rank {
-                coords[d] = r / out_strides[d];
-                r %= out_strides[d];
-            }
-            coords[axis_usize] += offset_along_axis;
-            let src = coords
-                .iter()
-                .zip(strides.iter())
-                .map(|(&c, &s)| c * s)
-                .sum::<usize>();
-            out_data.push(data[src]);
-        }
         offset_along_axis += sz;
+
         if out_idx < node.outputs.len() {
-            let t = Tensor::from_vec(out_shape, out_data).map_err(|e| OnnxError::DecodeFailed {
-                message: e.to_string(),
-            })?;
+            let t =
+                Tensor::from_aligned(out_shape, out_data).map_err(|e| OnnxError::DecodeFailed {
+                    message: e.to_string(),
+                })?;
             env.insert(node.outputs[out_idx].clone(), t);
+            if input_is_nhwc {
+                env.mark_nhwc(&node.outputs[out_idx]);
+            }
         }
     }
     Ok(())

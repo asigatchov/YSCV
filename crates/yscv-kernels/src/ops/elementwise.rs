@@ -10,56 +10,7 @@ use super::simd::{
     sigmoid_slice_dispatch, silu_slice_dispatch, tanh_slice_dispatch,
 };
 
-// GCD low-overhead parallelism (macOS: ~0.3µs dispatch, Linux: scoped threads).
-#[allow(unsafe_code)]
-mod par {
-    #[cfg(target_os = "macos")]
-    use std::ffi::c_void;
-
-    #[cfg(target_os = "macos")]
-    #[allow(unsafe_code)]
-    unsafe extern "C" {
-        fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *const c_void;
-        fn dispatch_apply_f(
-            iterations: usize,
-            queue: *const c_void,
-            context: *mut c_void,
-            work: unsafe extern "C" fn(*mut c_void, usize),
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[inline]
-    #[allow(unsafe_code)]
-    pub fn parallel_for<F: Fn(usize) + Sync>(n: usize, f: F) {
-        #[allow(unsafe_code)]
-        unsafe extern "C" fn call<F: Fn(usize) + Sync>(ctx: *mut c_void, i: usize) {
-            unsafe {
-                (*(ctx as *const F))(i);
-            }
-        }
-        let queue = unsafe { dispatch_get_global_queue(0, 0) };
-        unsafe {
-            dispatch_apply_f(n, queue, &f as *const F as *mut c_void, call::<F>);
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[inline]
-    pub fn parallel_for<F: Fn(usize) + Sync + Send>(n: usize, f: F) {
-        if n <= 1 {
-            for i in 0..n {
-                f(i);
-            }
-            return;
-        }
-        // Use rayon global thread pool — threads are pre-spawned, ~0.5µs dispatch.
-        use rayon::prelude::*;
-        (0..n).into_par_iter().for_each(f);
-    }
-}
-
-/// Elementwise ReLU activation. GCD-parallelized for large tensors.
+/// Elementwise ReLU activation.
 #[inline]
 #[allow(unsafe_code)]
 pub fn relu(input: &Tensor) -> Tensor {
@@ -73,18 +24,24 @@ pub fn relu(input: &Tensor) -> Tensor {
             .map(|p| p.get())
             .unwrap_or(4);
         let chunk = len.div_ceil(n_chunks);
-        let in_ptr = input_data.as_ptr() as usize;
-        let out_ptr = output.as_mut_ptr() as usize;
-        par::parallel_for(n_chunks, |t| {
-            let start = t * chunk;
-            let end = (start + chunk).min(len);
-            let inp = unsafe {
-                std::slice::from_raw_parts((in_ptr as *const f32).add(start), end - start)
-            };
-            let out = unsafe {
-                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), end - start)
-            };
-            relu_to_slice_dispatch(inp, out);
+        // SAFETY: Each chunk accesses disjoint, non-overlapping index ranges.
+        // input_data lives for the duration of this function. output is owned.
+        let in_base = input_data.as_ptr();
+        let out_base = output.as_mut_ptr();
+        std::thread::scope(|s| {
+            for t in 0..n_chunks {
+                let start = t * chunk;
+                let end = (start + chunk).min(len);
+                if start >= end {
+                    break;
+                }
+                let inp = unsafe { std::slice::from_raw_parts(in_base.add(start), end - start) };
+                let out =
+                    unsafe { std::slice::from_raw_parts_mut(out_base.add(start), end - start) };
+                s.spawn(move || {
+                    relu_to_slice_dispatch(inp, out);
+                });
+            }
         });
     } else {
         relu_to_slice_dispatch(input_data, &mut output);
@@ -301,6 +258,38 @@ pub fn silu_with_config_and_pool(
     let mut output = AlignedVec::<f32>::uninitialized(len);
     silu_slice_dispatch(input_data, &mut output);
     Tensor::from_raw_parts(input.shape(), input.strides(), output)
+}
+
+/// In-place SiLU: applies SiLU to a mutable tensor, avoiding allocation.
+/// The SIMD kernels load all inputs before storing outputs within each block,
+/// so aliasing input == output is safe.
+/// Uses rayon parallelism for large tensors (>100K elements).
+pub fn silu_inplace(tensor: &mut Tensor) {
+    let data = tensor.data_mut();
+    let len = data.len();
+    const PARALLEL_THRESHOLD: usize = 100_000;
+    if len >= PARALLEL_THRESHOLD {
+        // Parallel: split into chunks processed by different cores.
+        data.par_chunks_mut(32_768).for_each(|chunk| {
+            let ptr = chunk.as_mut_ptr();
+            let clen = chunk.len();
+            #[allow(unsafe_code)]
+            unsafe {
+                let input_slice = std::slice::from_raw_parts(ptr, clen);
+                let output_slice = std::slice::from_raw_parts_mut(ptr, clen);
+                silu_slice_dispatch(input_slice, output_slice);
+            }
+        });
+    } else {
+        // Small tensor: single-threaded SIMD.
+        let ptr = data.as_mut_ptr();
+        #[allow(unsafe_code)]
+        unsafe {
+            let input_slice = std::slice::from_raw_parts(ptr, len);
+            let output_slice = std::slice::from_raw_parts_mut(ptr, len);
+            silu_slice_dispatch(input_slice, output_slice);
+        }
+    }
 }
 
 /// Elementwise Mish activation: `x * tanh(softplus(x))` = `x * tanh(ln(1 + exp(x)))`.

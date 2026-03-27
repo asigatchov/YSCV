@@ -30,7 +30,8 @@ python benchmarks/python/bench_opencv.py    # OpenCV
 | u8 imgproc (vs OpenCV) | 10 | 0 | 0 | 0 |
 | f32 imgproc (vs OpenCV) | 6 | 0 | 0 | 0 |
 | Video (vs OpenCV) | 1 | 0 | 0 | 0 |
-| **Total** | **72** | **~4** | **0** | **0** |
+| ONNX inference (vs onnxruntime/tract) | 5 | 0 | 0 | 0 |
+| **Total** | **77** | **~4** | **0** | **0** |
 
 ## Tensor Elementwise Ops (1M f32, vs NumPy)
 
@@ -156,6 +157,83 @@ python benchmarks/python/bench_opencv.py    # OpenCV
 | Recognize query | 0.000448ms |
 | CLI people pipeline | 0.075ms |
 | CLI face pipeline | 0.162ms |
+
+## ONNX Inference (YOLOv8n / YOLO11n, 640×640 input)
+
+End-to-end model inference benchmarks against onnxruntime, Apple CoreML, and tract.
+Methodology: 50 timed runs after warmup, min/avg reported. Apple Silicon M3 Pro.
+
+### CPU Inference
+
+| Runtime | YOLOv8n | YOLO11n | Notes |
+|---------|---------|---------|-------|
+| **yscv** | **31.9ms** | **46.0ms** | Pure Rust, NHWC layout, BLAS matmul |
+| onnxruntime 1.19 CPU | 95.4ms | FAILED | Opset 22 unsupported |
+| tract 0.21 | 217.2ms | FAILED | TDim parse error |
+
+yscv CPU is **3× faster** than onnxruntime and **6.8× faster** than tract on YOLOv8n.
+Both competitors fail on YOLO11n (opset 22), while yscv runs it without issues.
+
+### GPU Inference (Metal, Apple Silicon)
+
+| Runtime | YOLOv8n (min) | YOLOv8n (avg) | YOLO11n (min) | YOLO11n (avg) | Notes |
+|---------|:---:|:---:|:---:|:---:|-------|
+| **yscv Metal** | **11.8ms** | **13.0ms** | **12.4ms** | **13.1ms** | Pure Metal, f16 pipeline, Winograd 4×4, NEON input upload |
+| onnxruntime CoreML | 13.4ms | 14.8ms | FAILED | FAILED | Apple Neural Engine delegation |
+
+yscv Metal is **14% faster** than CoreML on YOLOv8n — and CoreML delegates to Apple's Neural Engine (ANE), a dedicated hardware accelerator not available through public Metal API. CoreML **completely fails** on YOLO11n (opset 22), while yscv runs it at 12.4ms. yscv is the only runtime that runs both models on GPU.
+
+### Metal Pipeline Architecture
+
+The Metal backend compiles an ONNX graph into a sequence of `MetalOp`s executed in a single
+fused command buffer. Key optimizations (in order of impact):
+
+| Optimization | Impact | Description |
+|-------------|--------|-------------|
+| **Winograd F(4×4, 3×3)** | ~40% of GPU time | 2.25× FLOP reduction for stride-1 3×3 convs; SIMD group matrix multiply with f32 accumulation |
+| **F16 inter-op pipeline** | Halves bandwidth | All intermediate buffers use f16; weights pre-packed as f16 at compile time |
+| **NEON input upload** | Eliminates GPU cast | CPU-side `fcvtn`+`st3` converts f32 NCHW → f16 NHWC faster than GPU kernel |
+| **Conv+SiLU+Add fusion** | Fewer ops | Residual addition and activation fused into conv write-back epilogue |
+| **Vectorized f16 kernels** | Better throughput | All utility ops (concat, split, permute, resize) use `half4` vectorized I/O |
+| **Concat fusion** | Eliminates copies | Conv outputs write directly into concat buffer via `out_stride`/`out_offset` |
+| **Detection head fusion** | Fused permute+concat | NHWC→NCHW permutations + spatial concat fused into single `NhwcToFlatConcat` kernel |
+| **Zero-cost buffer aliasing** | No-op reshapes | Reshape/Flatten/Squeeze/Unsqueeze alias existing buffers |
+| **Parallel softmax** | Threadgroup reduction | Adaptive threadgroup size (32/128/256) with shared-memory reduction |
+| **Widened SiLU look-ahead** | Fewer Metal ops | Detects SiLU patterns up to 5 nodes ahead (detection head interleaving) |
+| **In-place SiLU/Binary** | Fewer buffers | Dead input buffers reused as output for elementwise ops |
+
+### Metal Op Distribution (YOLOv8n: 110 ops, YOLO11n: 196 ops)
+
+| Op Type | YOLOv8n | YOLO11n | GPU Time Share |
+|---------|:---:|:---:|---:|
+| ConvWinograd | 32 | 28 | ~34% |
+| ConvGemm (1×1 + 3×3) | 32 | 53 | ~31% |
+| Concat | 13 | 28 | ~9% |
+| SplitFused | 8 | 9 | ~5% |
+| CpuReshape (GPU permute) | 4 | 13 | ~3% |
+| Binary/BroadcastBinary | 6 | 26 | ~2% |
+| NhwcToFlatConcat | 2 | 1 | ~1% |
+| Other (MaxPool, Resize, etc.) | 13 | 38 | ~15% |
+
+### Metal Timing Breakdown (YOLOv8n, best run)
+
+| Phase | Time | Description |
+|-------|------|-------------|
+| Upload | 0.09ms | NEON `fcvtn`+`st3`: f32 NCHW → f16 NHWC (1.2M pixels) |
+| Encode | 0.06ms | CPU command buffer encoding (110 ops) |
+| GPU compute | 11.4ms | Single fused command buffer execution |
+| Readback | ~0.2ms | f16 → f32 cast + buffer read |
+| **Total** | **11.8ms** | End-to-end wall-clock |
+
+### Competitor Scorecard
+
+| Metric | yscv | onnxruntime | tract |
+|--------|------|-------------|-------|
+| YOLOv8n CPU | **WIN** (3×) | baseline (95ms) | 6.7× slower |
+| YOLO11n CPU | **WIN** | FAIL | FAIL |
+| YOLOv8n GPU | **WIN** (11.8ms vs 13.4ms) | CoreML (ANE hw) | N/A |
+| YOLO11n GPU | **WIN** (12.4ms) | FAIL | N/A |
+| Opset 22 support | Yes | No | No |
 
 ## Cross-Platform SIMD Coverage
 

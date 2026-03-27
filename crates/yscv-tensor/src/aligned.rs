@@ -53,9 +53,12 @@ impl<T> AlignedVec<T> {
     }
 
     /// Creates an `AlignedVec` from an existing `Vec<T>`, copying data into
-    /// aligned storage.
+    /// aligned storage. Requires `T: Copy` to ensure bitwise copy is sound.
     #[allow(unsafe_code)]
-    pub fn from_vec(v: Vec<T>) -> Self {
+    pub fn from_vec(v: Vec<T>) -> Self
+    where
+        T: Copy,
+    {
         let len = v.len();
         if len == 0 {
             return Self::new();

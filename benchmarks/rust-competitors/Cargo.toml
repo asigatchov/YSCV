@@ -1,0 +1,12 @@
+[package]
+name = "bench-competitors"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tract-onnx = { version = "0.21", optional = true }
+
+[features]
+default = ["tract"]
+tract = ["dep:tract-onnx"]

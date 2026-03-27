@@ -980,6 +980,11 @@ pub fn silu(input: &Tensor) -> Tensor {
     ops::silu(input)
 }
 
+/// In-place SiLU: applies SiLU to a mutable tensor, avoiding allocation.
+pub fn silu_inplace(tensor: &mut Tensor) {
+    ops::silu_inplace(tensor)
+}
+
 /// Elementwise Mish activation: `x * tanh(ln(1 + exp(x)))`.
 pub fn mish(input: &Tensor) -> Tensor {
     ops::mish(input)
@@ -1127,6 +1132,27 @@ pub fn conv2d_nhwc(
     stride_w: usize,
 ) -> Result<Tensor, KernelError> {
     CpuBackend.conv2d_nhwc(input, kernel, bias, stride_h, stride_w)
+}
+
+/// NHWC convolution with implicit zero-padding (avoids separate padded tensor allocation).
+/// Only available when the `blas` feature is enabled.
+#[cfg(feature = "blas")]
+pub fn conv2d_nhwc_padded(
+    input: &Tensor,
+    kernel: &Tensor,
+    bias: Option<&Tensor>,
+    stride_h: usize,
+    stride_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+    activation: ops::Activation,
+) -> Result<Tensor, KernelError> {
+    ops::conv2d_nhwc_padded(
+        input, kernel, bias, stride_h, stride_w, pad_top, pad_left, pad_bottom, pad_right,
+        activation,
+    )
 }
 
 /// NHWC convolution without padding with explicit parallelization heuristics.
@@ -1310,6 +1336,12 @@ pub fn rms_norm_last_dim_with_config(
 /// Deterministic rank-2 matrix multiplication: `(m x k) * (k x n) -> (m x n)`.
 pub fn matmul_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, KernelError> {
     CpuBackend.matmul_2d(lhs, rhs)
+}
+
+/// Zero-copy slice-based matmul: C[m×n] = A[m×k] × B[k×n].
+/// Writes directly into `out` without any intermediate allocation.
+pub fn matmul_2d_slices(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut [f32]) {
+    ops::matmul_2d_slices(a, m, k, b, n, out);
 }
 
 /// Single-thread deterministic rank-2 matrix multiplication.

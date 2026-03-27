@@ -1,7 +1,8 @@
-use super::conv::{nchw_to_nhwc, nhwc_to_nchw};
+use super::conv::nchw_to_nhwc;
 use super::*;
 
 pub(super) fn exec_batch_norm(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
+    let input_is_nhwc = env.is_nhwc(&node.inputs[0]);
     let input = get_tensor(env, &node.name, &node.inputs[0])?;
     let gamma = get_tensor(env, &node.name, &node.inputs[1])?;
     let beta = get_tensor(env, &node.name, &node.inputs[2])?;
@@ -9,7 +10,13 @@ pub(super) fn exec_batch_norm(node: &OnnxNode, env: &mut TensorEnv) -> Result<()
     let var = get_tensor(env, &node.name, &node.inputs[4])?;
     let epsilon = get_attr_float(node, "epsilon").unwrap_or(1e-5);
 
-    let input_nhwc = nchw_to_nhwc(input)?;
+    let input_nhwc_owned;
+    let input_nhwc: &Tensor = if input_is_nhwc {
+        input
+    } else {
+        input_nhwc_owned = nchw_to_nhwc(input)?;
+        &input_nhwc_owned
+    };
     let params = BatchNorm2dParams {
         gamma,
         beta,
@@ -17,11 +24,11 @@ pub(super) fn exec_batch_norm(node: &OnnxNode, env: &mut TensorEnv) -> Result<()
         variance: var,
         epsilon,
     };
-    let out_nhwc = batch_norm2d_nhwc(&input_nhwc, params).map_err(|e| OnnxError::DecodeFailed {
+    let out_nhwc = batch_norm2d_nhwc(input_nhwc, params).map_err(|e| OnnxError::DecodeFailed {
         message: e.to_string(),
     })?;
-    let out_nchw = nhwc_to_nchw(&out_nhwc)?;
-    env.insert(node.outputs[0].clone(), out_nchw);
+    env.insert(node.outputs[0].clone(), out_nhwc);
+    env.mark_nhwc(&node.outputs[0]);
     Ok(())
 }
 
@@ -35,8 +42,8 @@ pub(super) fn exec_softmax(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), O
 }
 
 pub(super) fn exec_dropout(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
-    let input = get_tensor(env, &node.name, &node.inputs[0])?;
-    env.insert(node.outputs[0].clone(), input.clone());
+    // Zero-copy: alias output to input (inference-time no-op)
+    env.alias(&node.outputs[0], &node.inputs[0]);
     Ok(())
 }
 
