@@ -145,17 +145,20 @@ fn pool2d_nhwc_row(
     let window_area = (plan.kernel_h * plan.kernel_w) as f32;
     let inv_area = 1.0 / window_area;
 
-    // Fast path: 2×2 max pool with stride 2 and channels == 1.
-    // Process 4 output pixels at a time by loading 8 consecutive input pixels
-    // and taking pairwise max.
+    // Fast path: 2×2 max pool with stride 2.
     if plan.kernel_h == 2
         && plan.kernel_w == 2
         && plan.stride_h == 2
         && plan.stride_w == 2
-        && plan.channels == 1
         && matches!(kind, Pool2dKind::Max)
     {
-        pool2d_2x2s2_max_row(input, plan, batch_input_base, in_y0, out_row);
+        if plan.channels == 1 {
+            // Single-channel: pairwise SIMD across output pixels.
+            pool2d_2x2s2_max_row(input, plan, batch_input_base, in_y0, out_row);
+        } else {
+            // Multi-channel: SIMD across channel dimension, 4 loads → 1 store.
+            pool2d_2x2s2_max_row_mc(input, plan, batch_input_base, in_y0, out_row);
+        }
         return;
     }
 
@@ -187,6 +190,117 @@ fn pool2d_nhwc_row(
                 *v *= inv_area;
             }
         }
+    }
+}
+
+/// Optimized 2×2 max-pool with stride 2, multi-channel (NHWC).
+/// Loads all 4 kernel positions directly and computes max in registers,
+/// avoiding the init + 4× accumulate pattern of the generic path.
+#[allow(unsafe_code)]
+fn pool2d_2x2s2_max_row_mc(
+    input: &[f32],
+    plan: Pool2dPlan,
+    batch_input_base: usize,
+    in_y0: usize,
+    out_row: &mut [f32],
+) {
+    let c = plan.channels;
+    let in_w_c = plan.in_w * c;
+    let row0_base = batch_input_base + in_y0 * in_w_c;
+    let row1_base = row0_base + in_w_c;
+
+    for out_x in 0..plan.out_w {
+        let in_x0 = out_x * 2;
+        let out_off = out_x * c;
+        // 4 pixel offsets in the 2×2 window
+        let p00 = row0_base + in_x0 * c;
+        let p01 = p00 + c;
+        let p10 = row1_base + in_x0 * c;
+        let p11 = p10 + c;
+        let out_slice = &mut out_row[out_off..out_off + c];
+
+        let mut i = 0usize;
+
+        #[cfg(target_arch = "aarch64")]
+        if !cfg!(miri) && c >= 4 && std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe {
+                pool2d_2x2s2_max_mc_neon(input, p00, p01, p10, p11, out_slice, &mut i);
+            }
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if !cfg!(miri) && c >= 4 && std::is_x86_feature_detected!("sse") {
+            unsafe {
+                pool2d_2x2s2_max_mc_sse(input, p00, p01, p10, p11, out_slice, &mut i);
+            }
+        }
+
+        // Scalar tail
+        while i < c {
+            let a = input[p00 + i];
+            let b = input[p01 + i];
+            let c_val = input[p10 + i];
+            let d = input[p11 + i];
+            out_slice[i] = a.max(b).max(c_val.max(d));
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+unsafe fn pool2d_2x2s2_max_mc_neon(
+    input: &[f32],
+    p00: usize,
+    p01: usize,
+    p10: usize,
+    p11: usize,
+    out: &mut [f32],
+    i: &mut usize,
+) {
+    use std::arch::aarch64::*;
+    let ip = input.as_ptr();
+    let op = out.as_mut_ptr();
+    let len = out.len();
+    while *i + 4 <= len {
+        let a = vld1q_f32(ip.add(p00 + *i));
+        let b = vld1q_f32(ip.add(p01 + *i));
+        let c = vld1q_f32(ip.add(p10 + *i));
+        let d = vld1q_f32(ip.add(p11 + *i));
+        let m = vmaxq_f32(vmaxq_f32(a, b), vmaxq_f32(c, d));
+        vst1q_f32(op.add(*i), m);
+        *i += 4;
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse")]
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+unsafe fn pool2d_2x2s2_max_mc_sse(
+    input: &[f32],
+    p00: usize,
+    p01: usize,
+    p10: usize,
+    p11: usize,
+    out: &mut [f32],
+    i: &mut usize,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+    let ip = input.as_ptr();
+    let op = out.as_mut_ptr();
+    let len = out.len();
+    while *i + 4 <= len {
+        let a = _mm_loadu_ps(ip.add(p00 + *i));
+        let b = _mm_loadu_ps(ip.add(p01 + *i));
+        let c = _mm_loadu_ps(ip.add(p10 + *i));
+        let d = _mm_loadu_ps(ip.add(p11 + *i));
+        let m = _mm_max_ps(_mm_max_ps(a, b), _mm_max_ps(c, d));
+        _mm_storeu_ps(op.add(*i), m);
+        *i += 4;
     }
 }
 
@@ -433,4 +547,191 @@ unsafe fn pool_accumulate_sse(out: &mut [f32], input: &[f32], kind: Pool2dKind) 
             }
         }
     }
+}
+
+// ── NCHW pool functions ────────────────────────────────────────────
+
+/// NCHW max pool: parallelized across channel planes, SIMD within each plane.
+pub fn max_pool2d_nchw(
+    input: &Tensor,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+) -> Result<Tensor, KernelError> {
+    pool2d_nchw(
+        input,
+        kernel_h,
+        kernel_w,
+        stride_h,
+        stride_w,
+        pad_top,
+        pad_left,
+        pad_bottom,
+        pad_right,
+        Pool2dKind::Max,
+    )
+}
+
+/// NCHW avg pool: parallelized across channel planes, SIMD within each plane.
+pub fn avg_pool2d_nchw(
+    input: &Tensor,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+) -> Result<Tensor, KernelError> {
+    pool2d_nchw(
+        input,
+        kernel_h,
+        kernel_w,
+        stride_h,
+        stride_w,
+        pad_top,
+        pad_left,
+        pad_bottom,
+        pad_right,
+        Pool2dKind::Avg,
+    )
+}
+
+fn pool2d_nchw(
+    input: &Tensor,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+    kind: Pool2dKind,
+) -> Result<Tensor, KernelError> {
+    if input.rank() != 4 {
+        return Err(KernelError::InvalidPoolRank {
+            got_rank: input.rank(),
+        });
+    }
+    let s = input.shape();
+    let (n, c, ih, iw) = (s[0], s[1], s[2], s[3]);
+    let oh = (ih + pad_top + pad_bottom - kernel_h) / stride_h + 1;
+    let ow = (iw + pad_left + pad_right - kernel_w) / stride_w + 1;
+    let plane_out = oh * ow;
+    let total_planes = n * c;
+    let total_out = total_planes * plane_out;
+
+    let data = input.data();
+    let no_pad = pad_top == 0 && pad_left == 0 && pad_bottom == 0 && pad_right == 0;
+    let inv_area = 1.0 / (kernel_h * kernel_w) as f32;
+
+    let mut output = AlignedVec::<f32>::uninitialized(total_out);
+
+    let work = |out_chunk: &mut [f32], plane_idx: usize| {
+        let in_base = plane_idx * ih * iw;
+        let plane = &data[in_base..in_base + ih * iw];
+
+        // Fast path: 2×2 stride 2 max pool, no padding — reuse SIMD row helper.
+        if no_pad
+            && kernel_h == 2
+            && kernel_w == 2
+            && stride_h == 2
+            && stride_w == 2
+            && matches!(kind, Pool2dKind::Max)
+        {
+            let tmp_plan = Pool2dPlan {
+                batch: 1,
+                in_h: ih,
+                in_w: iw,
+                channels: 1,
+                out_h: oh,
+                out_w: ow,
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+                output_len: plane_out,
+            };
+            for oy in 0..oh {
+                let out_row = &mut out_chunk[oy * ow..(oy + 1) * ow];
+                pool2d_2x2s2_max_row(plane, tmp_plan, 0, oy * 2, out_row);
+            }
+            return;
+        }
+
+        // General path
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut val = match kind {
+                    Pool2dKind::Max => f32::NEG_INFINITY,
+                    Pool2dKind::Avg => 0.0,
+                };
+                if no_pad {
+                    let iy0 = oy * stride_h;
+                    let ix0 = ox * stride_w;
+                    for ky in 0..kernel_h {
+                        let row_off = (iy0 + ky) * iw + ix0;
+                        for kx in 0..kernel_w {
+                            let v = plane[row_off + kx];
+                            match kind {
+                                Pool2dKind::Max => {
+                                    if v > val {
+                                        val = v;
+                                    }
+                                }
+                                Pool2dKind::Avg => val += v,
+                            }
+                        }
+                    }
+                } else {
+                    for ky in 0..kernel_h {
+                        let iy = oy * stride_h + ky;
+                        if iy < pad_top || iy >= ih + pad_top {
+                            continue;
+                        }
+                        let row_off = (iy - pad_top) * iw;
+                        for kx in 0..kernel_w {
+                            let ix = ox * stride_w + kx;
+                            if ix < pad_left || ix >= iw + pad_left {
+                                continue;
+                            }
+                            let v = plane[row_off + ix - pad_left];
+                            match kind {
+                                Pool2dKind::Max => {
+                                    if v > val {
+                                        val = v;
+                                    }
+                                }
+                                Pool2dKind::Avg => val += v,
+                            }
+                        }
+                    }
+                }
+                if matches!(kind, Pool2dKind::Avg) {
+                    val *= inv_area;
+                }
+                out_chunk[oy * ow + ox] = val;
+            }
+        }
+    };
+
+    if total_out >= 262_144 {
+        output
+            .par_chunks_mut(plane_out)
+            .enumerate()
+            .for_each(|(idx, chunk)| work(chunk, idx));
+    } else {
+        for (idx, chunk) in output.chunks_mut(plane_out).enumerate() {
+            work(chunk, idx);
+        }
+    }
+
+    Tensor::from_aligned(vec![n, c, oh, ow], output).map_err(Into::into)
 }

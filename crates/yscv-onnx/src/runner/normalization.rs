@@ -10,6 +10,36 @@ pub(super) fn exec_batch_norm(node: &OnnxNode, env: &mut TensorEnv) -> Result<()
     let var = get_tensor(env, &node.name, &node.inputs[4])?;
     let epsilon = get_attr_float(node, "epsilon").unwrap_or(1e-5);
 
+    // NCHW fast path — channel dim is contiguous per spatial plane
+    if !input_is_nhwc && input.rank() == 4 {
+        let s = input.shape();
+        let (n, c, h, w) = (s[0], s[1], s[2], s[3]);
+        let gamma_d = gamma.data();
+        let beta_d = beta.data();
+        let mean_d = mean.data();
+        let var_d = var.data();
+        let in_data = input.data();
+        let mut out_data = vec![0.0f32; n * c * h * w];
+        for b in 0..n {
+            for ch in 0..c {
+                let inv_std = 1.0 / (var_d[ch] + epsilon).sqrt();
+                let scale = gamma_d[ch] * inv_std;
+                let bias = beta_d[ch] - mean_d[ch] * scale;
+                let base = (b * c + ch) * h * w;
+                for i in 0..h * w {
+                    out_data[base + i] = in_data[base + i] * scale + bias;
+                }
+            }
+        }
+        let result =
+            Tensor::from_vec(vec![n, c, h, w], out_data).map_err(|e| OnnxError::DecodeFailed {
+                message: e.to_string(),
+            })?;
+        env.insert(node.outputs[0].clone(), result);
+        // Do NOT mark_nhwc — output stays NCHW
+        return Ok(());
+    }
+
     let input_nhwc_owned;
     let input_nhwc: &Tensor = if input_is_nhwc {
         input

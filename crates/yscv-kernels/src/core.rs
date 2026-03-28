@@ -51,22 +51,24 @@ pub use multi_device::{
     enumerate_gpu_devices,
 };
 pub use ops::Activation;
+#[cfg(all(target_os = "macos", feature = "blas"))]
+pub use ops::bnns_conv;
 pub use ops::{
     BinaryKind, DEFAULT_ELEMENTWISE_MIN_PARALLEL_ELEMENTS,
     DEFAULT_MATMUL_MIN_PARALLEL_OUTPUT_ELEMENTS, DEFAULT_MATMUL_MIN_PARALLEL_SHARED_DIM,
     ParallelElementwiseConfig, ParallelMatmulConfig, add_reduce_dispatch, add_with_config_and_pool,
-    avg_pool2d_nhwc_with_config_and_pool, batch_norm2d_nhwc_with_config_and_pool,
+    avg_pool2d_nchw, avg_pool2d_nhwc_with_config_and_pool, batch_norm2d_nhwc_with_config_and_pool,
     binary_same_shape_dispatch, conv2d_nhwc_with_config_and_pool, conv3d,
     depthwise_conv2d_nhwc_with_config_and_pool, exp_slice_dispatch, exp_with_config_and_pool,
     fma_slice_dispatch, group_norm_nhwc_with_config_and_pool,
     layer_norm_last_dim_with_config_and_pool, log_softmax_last_dim_with_config_and_pool,
     logsumexp_last_dim_with_config_and_pool, matmul_2d_with_config_and_pool, matmul_row_dispatch,
-    max_pool2d_nhwc_with_config_and_pool, max_reduce_dispatch, mul_with_config_and_pool, relu_out,
-    relu_slice_dispatch, relu_to_slice_dispatch, relu_with_config_and_pool,
-    rms_norm_last_dim_with_config_and_pool, separable_conv2d_nhwc_with_config_and_pool,
-    sigmoid_slice_dispatch, sigmoid_with_config_and_pool, softmax_last_dim_with_config_and_pool,
-    sub_exp_slice_dispatch, sub_with_config_and_pool, tanh_act_with_config_and_pool,
-    tanh_slice_dispatch,
+    max_pool2d_nchw, max_pool2d_nhwc_with_config_and_pool, max_reduce_dispatch,
+    mul_with_config_and_pool, relu_out, relu_slice_dispatch, relu_to_slice_dispatch,
+    relu_with_config_and_pool, rms_norm_last_dim_with_config_and_pool,
+    separable_conv2d_nhwc_with_config_and_pool, sigmoid_slice_dispatch,
+    sigmoid_with_config_and_pool, softmax_last_dim_with_config_and_pool, sub_exp_slice_dispatch,
+    sub_with_config_and_pool, tanh_act_with_config_and_pool, tanh_slice_dispatch,
 };
 
 #[path = "tests/mod.rs"]

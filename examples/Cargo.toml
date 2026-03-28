@@ -80,5 +80,19 @@ name = "bench_mps_gemm"
 path = "src/bench_mps_gemm.rs"
 required-features = ["metal-backend"]
 
+[[example]]
+name = "bench_vball_cpu"
+path = "src/bench_vball_cpu.rs"
+
+[[example]]
+name = "bench_mpsgraph"
+path = "src/bench_mpsgraph.rs"
+required-features = ["metal-backend"]
+
+[[example]]
+name = "bench_metal_vball"
+path = "src/bench_metal_vball.rs"
+required-features = ["metal-backend"]
+
 [lints]
 workspace = true

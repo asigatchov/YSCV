@@ -1531,6 +1531,337 @@ pub fn conv3d(
     (output, output_shape)
 }
 
+// ---------------------------------------------------------------------------
+// SIMD depthwise conv2d kernels (depth_multiplier == 1 fast path)
+// ---------------------------------------------------------------------------
+
+/// NEON-accelerated depthwise conv row for `depth_multiplier == 1`.
+/// Vectorizes across the channel dimension (4 channels per `float32x4_t`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn depthwise_conv2d_nhwc_row_neon(
+    input: &[f32],
+    kernel: &[f32],
+    bias: Option<&[f32]>,
+    plan: DepthwiseConv2dPlan,
+    row_idx: usize,
+    out_row: &mut [f32],
+) {
+    use core::arch::aarch64::*;
+
+    let batch_idx = row_idx / plan.out_h;
+    let out_y = row_idx % plan.out_h;
+    let in_y0 = out_y * plan.stride_h;
+    let batch_input_base = batch_idx * plan.in_h * plan.in_w * plan.channels;
+    let channels = plan.channels;
+    let simd_end = channels & !3; // round down to multiple of 4
+    let kh = plan.kernel_h;
+    let kw = plan.kernel_w;
+
+    let inp_ptr = input.as_ptr();
+    let ker_ptr = kernel.as_ptr();
+    let out_ptr = out_row.as_mut_ptr();
+
+    for out_x in 0..plan.out_w {
+        let in_x0 = out_x * plan.stride_w;
+        let out_base = out_x * channels;
+
+        // Process 4 channels at a time with accumulator kept in a register.
+        // This avoids the load-modify-store per kernel position — the
+        // accumulator stays in a NEON register across all kh×kw positions.
+        let mut ch = 0;
+        while ch + 4 <= simd_end {
+            // SAFETY: ch + 4 <= channels, all offsets bounded by plan dims.
+            unsafe {
+                let mut acc = if let Some(b) = bias {
+                    vld1q_f32(b.as_ptr().add(ch))
+                } else {
+                    vdupq_n_f32(0.0)
+                };
+
+                for ky in 0..kh {
+                    let in_y = in_y0 + ky;
+                    let input_row_base = batch_input_base + (in_y * plan.in_w + in_x0) * channels;
+                    let kernel_row_base = (ky * kw) * channels;
+
+                    for kx in 0..kw {
+                        let in_off = input_row_base + kx * channels + ch;
+                        let k_off = kernel_row_base + kx * channels + ch;
+                        let inp = vld1q_f32(inp_ptr.add(in_off));
+                        let ker = vld1q_f32(ker_ptr.add(k_off));
+                        acc = vfmaq_f32(acc, inp, ker);
+                    }
+                }
+
+                vst1q_f32(out_ptr.add(out_base + ch), acc);
+            }
+            ch += 4;
+        }
+        // Scalar tail for remaining channels.
+        while ch < channels {
+            let mut acc = bias.map_or(0.0, |b| b[ch]);
+            for ky in 0..kh {
+                let in_y = in_y0 + ky;
+                let input_row_base = batch_input_base + (in_y * plan.in_w + in_x0) * channels;
+                let kernel_row_base = (ky * kw) * channels;
+                for kx in 0..kw {
+                    acc += input[input_row_base + kx * channels + ch]
+                        * kernel[kernel_row_base + kx * channels + ch];
+                }
+            }
+            out_row[out_base + ch] = acc;
+            ch += 1;
+        }
+    }
+}
+
+/// AVX+FMA depthwise conv row for `depth_multiplier == 1`.
+/// Uses `_mm256_fmadd_ps` for fused multiply-add (Haswell+ / all modern x86).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx", enable = "fma")]
+#[allow(unsafe_code)]
+unsafe fn depthwise_conv2d_nhwc_row_avx_fma(
+    input: &[f32],
+    kernel: &[f32],
+    bias: Option<&[f32]>,
+    plan: DepthwiseConv2dPlan,
+    row_idx: usize,
+    out_row: &mut [f32],
+) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let batch_idx = row_idx / plan.out_h;
+    let out_y = row_idx % plan.out_h;
+    let in_y0 = out_y * plan.stride_h;
+    let batch_input_base = batch_idx * plan.in_h * plan.in_w * plan.channels;
+    let channels = plan.channels;
+    let simd_end = channels & !7;
+    let kh = plan.kernel_h;
+    let kw = plan.kernel_w;
+
+    let inp_ptr = input.as_ptr();
+    let ker_ptr = kernel.as_ptr();
+    let out_ptr = out_row.as_mut_ptr();
+
+    for out_x in 0..plan.out_w {
+        let in_x0 = out_x * plan.stride_w;
+        let out_base = out_x * channels;
+
+        // Process 8 channels at a time with accumulator in register.
+        let mut ch = 0;
+        while ch + 8 <= simd_end {
+            // SAFETY: ch + 8 <= channels, all offsets bounded by plan dims.
+            unsafe {
+                let mut acc = if let Some(b) = bias {
+                    _mm256_loadu_ps(b.as_ptr().add(ch))
+                } else {
+                    _mm256_setzero_ps()
+                };
+
+                for ky in 0..kh {
+                    let in_y = in_y0 + ky;
+                    let input_row_base = batch_input_base + (in_y * plan.in_w + in_x0) * channels;
+                    let kernel_row_base = (ky * kw) * channels;
+
+                    for kx in 0..kw {
+                        let in_off = input_row_base + kx * channels + ch;
+                        let k_off = kernel_row_base + kx * channels + ch;
+                        let inp = _mm256_loadu_ps(inp_ptr.add(in_off));
+                        let ker = _mm256_loadu_ps(ker_ptr.add(k_off));
+                        acc = _mm256_fmadd_ps(inp, ker, acc);
+                    }
+                }
+
+                _mm256_storeu_ps(out_ptr.add(out_base + ch), acc);
+            }
+            ch += 8;
+        }
+        // Scalar tail.
+        while ch < channels {
+            let mut acc = bias.map_or(0.0, |b| b[ch]);
+            for ky in 0..kh {
+                let in_y = in_y0 + ky;
+                let input_row_base = batch_input_base + (in_y * plan.in_w + in_x0) * channels;
+                let kernel_row_base = (ky * kw) * channels;
+                for kx in 0..kw {
+                    acc += input[input_row_base + kx * channels + ch]
+                        * kernel[kernel_row_base + kx * channels + ch];
+                }
+            }
+            out_row[out_base + ch] = acc;
+            ch += 1;
+        }
+    }
+}
+
+/// AVX-accelerated depthwise conv row for `depth_multiplier == 1` (no FMA fallback).
+/// Vectorizes across the channel dimension (8 channels per `__m256`).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+#[allow(unsafe_code)]
+unsafe fn depthwise_conv2d_nhwc_row_avx(
+    input: &[f32],
+    kernel: &[f32],
+    bias: Option<&[f32]>,
+    plan: DepthwiseConv2dPlan,
+    row_idx: usize,
+    out_row: &mut [f32],
+) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let batch_idx = row_idx / plan.out_h;
+    let out_y = row_idx % plan.out_h;
+    let in_y0 = out_y * plan.stride_h;
+    let batch_input_base = batch_idx * plan.in_h * plan.in_w * plan.channels;
+    let channels = plan.channels;
+    let simd_end = channels & !7; // round down to multiple of 8
+    let kh = plan.kernel_h;
+    let kw = plan.kernel_w;
+
+    let inp_ptr = input.as_ptr();
+    let ker_ptr = kernel.as_ptr();
+    let out_ptr = out_row.as_mut_ptr();
+
+    for out_x in 0..plan.out_w {
+        let in_x0 = out_x * plan.stride_w;
+        let out_base = out_x * channels;
+
+        // Process 8 channels at a time with accumulator in register.
+        let mut ch = 0;
+        while ch + 8 <= simd_end {
+            // SAFETY: ch + 8 <= channels, all offsets bounded by plan dims.
+            unsafe {
+                let mut acc = if let Some(b) = bias {
+                    _mm256_loadu_ps(b.as_ptr().add(ch))
+                } else {
+                    _mm256_setzero_ps()
+                };
+
+                for ky in 0..kh {
+                    let in_y = in_y0 + ky;
+                    let input_row_base = batch_input_base + (in_y * plan.in_w + in_x0) * channels;
+                    let kernel_row_base = (ky * kw) * channels;
+
+                    for kx in 0..kw {
+                        let in_off = input_row_base + kx * channels + ch;
+                        let k_off = kernel_row_base + kx * channels + ch;
+                        let inp = _mm256_loadu_ps(inp_ptr.add(in_off));
+                        let ker = _mm256_loadu_ps(ker_ptr.add(k_off));
+                        acc = _mm256_add_ps(acc, _mm256_mul_ps(inp, ker));
+                    }
+                }
+
+                _mm256_storeu_ps(out_ptr.add(out_base + ch), acc);
+            }
+            ch += 8;
+        }
+        // Scalar tail.
+        while ch < channels {
+            let mut acc = bias.map_or(0.0, |b| b[ch]);
+            for ky in 0..kh {
+                let in_y = in_y0 + ky;
+                let input_row_base = batch_input_base + (in_y * plan.in_w + in_x0) * channels;
+                let kernel_row_base = (ky * kw) * channels;
+                for kx in 0..kw {
+                    acc += input[input_row_base + kx * channels + ch]
+                        * kernel[kernel_row_base + kx * channels + ch];
+                }
+            }
+            out_row[out_base + ch] = acc;
+            ch += 1;
+        }
+    }
+}
+
+/// SSE-accelerated depthwise conv row for `depth_multiplier == 1`.
+/// Vectorizes across the channel dimension (4 channels per `__m128`).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse")]
+#[allow(unsafe_code)]
+unsafe fn depthwise_conv2d_nhwc_row_sse(
+    input: &[f32],
+    kernel: &[f32],
+    bias: Option<&[f32]>,
+    plan: DepthwiseConv2dPlan,
+    row_idx: usize,
+    out_row: &mut [f32],
+) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let batch_idx = row_idx / plan.out_h;
+    let out_y = row_idx % plan.out_h;
+    let in_y0 = out_y * plan.stride_h;
+    let batch_input_base = batch_idx * plan.in_h * plan.in_w * plan.channels;
+    let channels = plan.channels;
+    let simd_end = channels & !3; // round down to multiple of 4
+    let kh = plan.kernel_h;
+    let kw = plan.kernel_w;
+
+    let inp_ptr = input.as_ptr();
+    let ker_ptr = kernel.as_ptr();
+    let out_ptr = out_row.as_mut_ptr();
+
+    for out_x in 0..plan.out_w {
+        let in_x0 = out_x * plan.stride_w;
+        let out_base = out_x * channels;
+
+        // Process 4 channels at a time with accumulator in register.
+        let mut ch = 0;
+        while ch + 4 <= simd_end {
+            // SAFETY: ch + 4 <= channels, all offsets bounded by plan dims.
+            unsafe {
+                let mut acc = if let Some(b) = bias {
+                    _mm_loadu_ps(b.as_ptr().add(ch))
+                } else {
+                    _mm_setzero_ps()
+                };
+
+                for ky in 0..kh {
+                    let in_y = in_y0 + ky;
+                    let input_row_base = batch_input_base + (in_y * plan.in_w + in_x0) * channels;
+                    let kernel_row_base = (ky * kw) * channels;
+
+                    for kx in 0..kw {
+                        let in_off = input_row_base + kx * channels + ch;
+                        let k_off = kernel_row_base + kx * channels + ch;
+                        let inp = _mm_loadu_ps(inp_ptr.add(in_off));
+                        let ker = _mm_loadu_ps(ker_ptr.add(k_off));
+                        acc = _mm_add_ps(acc, _mm_mul_ps(inp, ker));
+                    }
+                }
+
+                _mm_storeu_ps(out_ptr.add(out_base + ch), acc);
+            }
+            ch += 4;
+        }
+        // Scalar tail.
+        while ch < channels {
+            let mut acc = bias.map_or(0.0, |b| b[ch]);
+            for ky in 0..kh {
+                let in_y = in_y0 + ky;
+                let input_row_base = batch_input_base + (in_y * plan.in_w + in_x0) * channels;
+                let kernel_row_base = (ky * kw) * channels;
+                for kx in 0..kw {
+                    acc += input[input_row_base + kx * channels + ch]
+                        * kernel[kernel_row_base + kx * channels + ch];
+                }
+            }
+            out_row[out_base + ch] = acc;
+            ch += 1;
+        }
+    }
+}
+
 fn depthwise_conv2d_nhwc_row(
     input: &[f32],
     kernel: &[f32],
@@ -1539,6 +1870,50 @@ fn depthwise_conv2d_nhwc_row(
     row_idx: usize,
     out_row: &mut [f32],
 ) {
+    // SIMD fast path for depth_multiplier == 1 (standard depthwise conv).
+    // When dm=1, out_channels == channels and the kernel layout simplifies to
+    // [KH, KW, C] — contiguous channel data enables vectorization.
+    if plan.depth_multiplier == 1 && plan.out_channels >= 4 && !cfg!(miri) {
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: NEON detected, pointers bounded by plan dimensions validated at
+            // function entry. Each output element written exactly once.
+            #[allow(unsafe_code)]
+            unsafe {
+                depthwise_conv2d_nhwc_row_neon(input, kernel, bias, plan, row_idx, out_row);
+            }
+            return;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX+FMA detected, same bounds guarantees.
+                #[allow(unsafe_code)]
+                unsafe {
+                    depthwise_conv2d_nhwc_row_avx_fma(input, kernel, bias, plan, row_idx, out_row);
+                }
+                return;
+            }
+            if is_x86_feature_detected!("avx") {
+                // SAFETY: AVX detected (no FMA), same bounds guarantees.
+                #[allow(unsafe_code)]
+                unsafe {
+                    depthwise_conv2d_nhwc_row_avx(input, kernel, bias, plan, row_idx, out_row);
+                }
+                return;
+            }
+            if is_x86_feature_detected!("sse") {
+                // SAFETY: SSE detected, same bounds guarantees.
+                #[allow(unsafe_code)]
+                unsafe {
+                    depthwise_conv2d_nhwc_row_sse(input, kernel, bias, plan, row_idx, out_row);
+                }
+                return;
+            }
+        }
+    }
+
+    // Scalar fallback (handles depth_multiplier > 1 and all other cases).
     let batch_idx = row_idx / plan.out_h;
     let out_y = row_idx % plan.out_h;
     let in_y0 = out_y * plan.stride_h;

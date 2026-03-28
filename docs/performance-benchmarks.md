@@ -30,8 +30,8 @@ python benchmarks/python/bench_opencv.py    # OpenCV
 | u8 imgproc (vs OpenCV) | 10 | 0 | 0 | 0 |
 | f32 imgproc (vs OpenCV) | 6 | 0 | 0 | 0 |
 | Video (vs OpenCV) | 1 | 0 | 0 | 0 |
-| ONNX inference (vs onnxruntime/tract) | 5 | 0 | 0 | 0 |
-| **Total** | **77** | **~4** | **0** | **0** |
+| ONNX inference (vs onnxruntime/tract) | 6 | 0 | 0 | 0 |
+| **Total** | **78** | **~4** | **0** | **0** |
 
 ## Tensor Elementwise Ops (1M f32, vs NumPy)
 
@@ -176,12 +176,19 @@ Both competitors fail on YOLO11n (opset 22), while yscv runs it without issues.
 
 ### GPU Inference (Metal, Apple Silicon)
 
-| Runtime | YOLOv8n (min) | YOLOv8n (avg) | YOLO11n (min) | YOLO11n (avg) | Notes |
-|---------|:---:|:---:|:---:|:---:|-------|
-| **yscv Metal** | **11.8ms** | **13.0ms** | **12.4ms** | **13.1ms** | Pure Metal, f16 pipeline, Winograd 4×4, NEON input upload |
-| onnxruntime CoreML | 13.4ms | 14.8ms | FAILED | FAILED | Apple Neural Engine delegation |
+Two Metal backends are available:
 
-yscv Metal is **14% faster** than CoreML on YOLOv8n — and CoreML delegates to Apple's Neural Engine (ANE), a dedicated hardware accelerator not available through public Metal API. CoreML **completely fails** on YOLO11n (opset 22), while yscv runs it at 12.4ms. yscv is the only runtime that runs both models on GPU.
+| Runtime | YOLOv8n | YOLO11n | Notes |
+|---------|:---:|:---:|-------|
+| **yscv MPSGraph** | **5.9ms** | — | Whole-model graph compilation, single GPU dispatch |
+| **yscv Metal per-op** | **24.1ms** | **21.5ms** | Per-op command buffer, Winograd + MPS GEMM |
+| onnxruntime CoreML | 13.4ms | FAILED | Apple Neural Engine delegation |
+
+**MPSGraph** compiles the entire ONNX model into an `MPSGraphExecutable` and runs it as a single GPU dispatch — eliminating per-op encoder transitions. This is the fastest path for supported models.
+
+**Metal per-op** is the fallback for models with ops that MPSGraph doesn't yet support (e.g., YOLO11n's C2PSA attention blocks with dynamic reshape chains). It still beats CPU by 1.4-1.7×.
+
+yscv is the only runtime that runs both YOLOv8n and YOLO11n on GPU. CoreML fails on YOLO11n (opset 22).
 
 ### Metal Pipeline Architecture
 
@@ -202,28 +209,18 @@ fused command buffer. Key optimizations (in order of impact):
 | **Widened SiLU look-ahead** | Fewer Metal ops | Detects SiLU patterns up to 5 nodes ahead (detection head interleaving) |
 | **In-place SiLU/Binary** | Fewer buffers | Dead input buffers reused as output for elementwise ops |
 
-### Metal Op Distribution (YOLOv8n: 110 ops, YOLO11n: 196 ops)
+### Metal Per-Op Distribution (YOLOv8n: 110 ops, YOLO11n: 204 ops)
 
-| Op Type | YOLOv8n | YOLO11n | GPU Time Share |
-|---------|:---:|:---:|---:|
-| ConvWinograd | 32 | 28 | ~34% |
-| ConvGemm (1×1 + 3×3) | 32 | 53 | ~31% |
-| Concat | 13 | 28 | ~9% |
-| SplitFused | 8 | 9 | ~5% |
-| CpuReshape (GPU permute) | 4 | 13 | ~3% |
-| Binary/BroadcastBinary | 6 | 26 | ~2% |
-| NhwcToFlatConcat | 2 | 1 | ~1% |
-| Other (MaxPool, Resize, etc.) | 13 | 38 | ~15% |
-
-### Metal Timing Breakdown (YOLOv8n, best run)
-
-| Phase | Time | Description |
-|-------|------|-------------|
-| Upload | 0.09ms | NEON `fcvtn`+`st3`: f32 NCHW → f16 NHWC (1.2M pixels) |
-| Encode | 0.06ms | CPU command buffer encoding (110 ops) |
-| GPU compute | 11.4ms | Single fused command buffer execution |
-| Readback | ~0.2ms | f16 → f32 cast + buffer read |
-| **Total** | **11.8ms** | End-to-end wall-clock |
+| Op Type | YOLOv8n | YOLO11n |
+|---------|:---:|:---:|
+| ConvWinograd (3×3 stride=1) | 32 | 28 |
+| MpsConv (MPS GEMM for 1×1+) | 30 | 51 |
+| Concat | 13 | 34 |
+| SplitFused | 8 | 9 |
+| CpuReshape (GPU permute) | 4 | 13 |
+| Binary/BroadcastBinary | 6 | 28 |
+| DepthwiseConv | — | 7 |
+| Other (MaxPool, Resize, etc.) | 17 | 34 |
 
 ### Competitor Scorecard
 
@@ -231,9 +228,29 @@ fused command buffer. Key optimizations (in order of impact):
 |--------|------|-------------|-------|
 | YOLOv8n CPU | **WIN** (3×) | baseline (95ms) | 6.7× slower |
 | YOLO11n CPU | **WIN** | FAIL | FAIL |
-| YOLOv8n GPU | **WIN** (11.8ms vs 13.4ms) | CoreML (ANE hw) | N/A |
-| YOLO11n GPU | **WIN** (12.4ms) | FAIL | N/A |
+| YOLOv8n GPU (MPSGraph) | **WIN** (5.9ms vs 13.4ms) | CoreML (ANE hw) | N/A |
+| YOLO11n GPU (per-op) | **WIN** (21.5ms) | FAIL | N/A |
 | Opset 22 support | Yes | No | No |
+
+## VballNetGrid Inference (DSConv model, 16.3 GFLOP)
+
+Model: VballNetGridV1b — 13 DSConvBlocks (depthwise 3×3 + pointwise 1×1), 4 MaxPool, head Conv+Sigmoid.
+Input `[1, 9, 432, 768]`, output `[1, 27, 27, 48]`, 42 ONNX nodes.
+
+### Optimization Progression (Apple Silicon)
+
+| Stage | Time | FPS | Speedup | What changed |
+|-------|------|-----|---------|--------------|
+| yscv BEFORE | 558 ms | 1.7 | — | Single-threaded, scalar depthwise |
+| + Multi-threading | 257 ms | 3.9 | 2.1× | `ParallelElementwiseConfig::default()` in public API |
+| + SIMD depthwise | **133 ms** | **7.5** | **4.2×** | NEON/AVX/SSE vectorized depthwise conv |
+| Python onnxruntime CPU | 177 ms | 5.6 | — | CPUExecutionProvider baseline |
+| yscv Metal per-op | 78.6 ms | 12.7 | 7.1× | Metal-native fused pipeline, MPS GEMM |
+| **yscv MPSGraph** | **11.0 ms** | **91** | **50.7×** | Whole-model GPU graph compilation |
+
+### Key Takeaway
+
+yscv CPU is **faster than onnxruntime CPU** on depthwise-separable models — no special flags needed. MPSGraph provides an additional **12× over CPU**, reaching 91 FPS on Apple Silicon.
 
 ## Cross-Platform SIMD Coverage
 
@@ -244,6 +261,7 @@ fused command buffer. Key optimizations (in order of impact):
 | Softmax/LogSoftmax | ✅ fused | ✅ fused | ✅ fused |
 | MatMul | ✅ BLAS | ✅ BLAS | ✅ BLAS + FMA |
 | Conv2d 3×3 | ✅ direct NEON | ✅ direct SSE | ✅ im2col + BLAS |
+| Depthwise Conv2d | ✅ 4-wide FMA | ✅ 4-wide | ✅ 8-wide |
 | u8 morphology/filter/sobel | ✅ 16B/iter | ✅ 16B/iter | ✅ 32B/iter (AVX2) |
 | f32 filter/morphology/geometry | ✅ 4-wide | ✅ 4-wide | ✅ 8-wide |
 | Median u8 | ✅ sort network | ✅ sort network | — |

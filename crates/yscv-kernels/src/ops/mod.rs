@@ -1,4 +1,6 @@
 pub(crate) mod attention;
+#[cfg(all(target_os = "macos", feature = "blas"))]
+pub mod bnns_conv;
 mod config;
 mod conv;
 mod deformable_conv;
@@ -54,4 +56,7 @@ pub use norm::{
     logsumexp_last_dim_with_config_and_pool, rms_norm_last_dim_with_config_and_pool,
     softmax_last_dim_with_config_and_pool,
 };
-pub use pool::{avg_pool2d_nhwc_with_config_and_pool, max_pool2d_nhwc_with_config_and_pool};
+pub use pool::{
+    avg_pool2d_nchw, avg_pool2d_nhwc_with_config_and_pool, max_pool2d_nchw,
+    max_pool2d_nhwc_with_config_and_pool,
+};

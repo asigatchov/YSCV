@@ -127,21 +127,135 @@ pub(crate) fn record_conv(
             output: out_name.clone(),
             params,
         });
+    } else if sh == 1 && sw == 1 && kh == 3 && kw == 3 && group == 1 {
+        // Winograd FIRST for 3×3 stride=1: 4× FLOP reduction + stays in unified
+        // single-encoder path (no encoder transitions). Always preferred over MPS
+        // for 3×3 because Winograd's FLOP reduction outweighs MPS GEMM speedup,
+        // and avoiding segmented dispatch eliminates ~0.6ms overhead per MPS op.
+        let tile_h = oh.div_ceil(4);
+        let tile_w = ow.div_ceil(4);
+        let n_tiles = n * tile_h * tile_w;
+
+        // Pre-transform weights: [9*ic, oc] → [36, ic, oc] as f16
+        let wino_w_key = format!("__mtl_wino4_w_{}", node.inputs[1]);
+        if !bufs.contains_key(&wino_w_key) {
+            let w_khwc = if is_khwc {
+                weight.clone()
+            } else {
+                oihw_to_khwc_cout(weight)?
+            };
+            let wdata = w_khwc.data();
+            let expected = 9 * ic * o_ch;
+            if wdata.len() != expected {
+                eprintln!(
+                    "  [winograd4] weight mismatch: {} '{}' w_shape={:?} is_khwc={} ic={} oc={} group={} data.len={} expected={}",
+                    node.op_type,
+                    node.name,
+                    w_khwc.shape(),
+                    is_khwc,
+                    ic,
+                    o_ch,
+                    group,
+                    wdata.len(),
+                    expected
+                );
+                ops.push(MetalOp::ConvGemm {
+                    input: input_name.clone(),
+                    weight: w_key,
+                    bias: b_key,
+                    output: out_name.clone(),
+                    params,
+                    f16io: true,
+                    residual: None,
+                });
+                return Ok(());
+            }
+            let transformed = winograd4x4_transform_weights_f16(wdata, ic, o_ch);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(transformed.as_ptr() as *const u8, transformed.len() * 2)
+            };
+            bufs.insert(
+                wino_w_key.clone(),
+                inf.device.new_buffer_with_data(
+                    bytes.as_ptr() as *const _,
+                    bytes.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+            );
+        }
+
+        // Double-buffered Winograd temp buffers: alternate between set 0 and set 1
+        // to enable GPU pipelining between consecutive Winograd convolutions.
+        let ti_size = 36 * n_tiles * ic;
+        let go_size = 36 * n_tiles * o_ch;
+        let wino_count = ops
+            .iter()
+            .filter(|op| matches!(op, MetalOp::ConvWinograd { .. }))
+            .count();
+        let wino_set = wino_count % 2;
+        let ti_key = format!("__mtl_wino4_shared_ti_{}", wino_set);
+        let go_key = format!("__mtl_wino4_shared_go_{}", wino_set);
+        // Grow shared buffers to max needed size
+        if let Some(existing) = bufs.get(&ti_key) {
+            let existing_len = existing.length() as usize / 2; // f16 = 2 bytes
+            if ti_size > existing_len {
+                bufs.insert(ti_key.clone(), inf.output_buffer_f16(ti_size));
+            }
+        } else {
+            bufs.insert(ti_key.clone(), inf.output_buffer_f16(ti_size));
+        }
+        if let Some(existing) = bufs.get(&go_key) {
+            let existing_len = existing.length() as usize / 2;
+            if go_size > existing_len {
+                bufs.insert(go_key.clone(), inf.output_buffer_f16(go_size));
+            }
+        } else {
+            bufs.insert(go_key.clone(), inf.output_buffer_f16(go_size));
+        }
+
+        let wino_params = WinogradParams {
+            batch: n as u32,
+            ih: ih as u32,
+            iw: iw as u32,
+            ic: ic as u32,
+            oh: oh as u32,
+            ow: ow as u32,
+            oc: o_ch as u32,
+            pad_h: pads[0] as u32,
+            pad_w: pads[1] as u32,
+            tile_h: tile_h as u32,
+            tile_w: tile_w as u32,
+            n_tiles: n_tiles as u32,
+            act,
+            out_stride: o_ch as u32,
+            out_offset: 0,
+            in_stride: ic as u32,
+            in_offset: 0,
+        };
+        ops.push(MetalOp::ConvWinograd {
+            input: input_name.clone(),
+            weight: wino_w_key,
+            bias: b_key,
+            output: out_name.clone(),
+            transformed_input: ti_key,
+            gemm_output: go_key,
+            wino_params,
+            ic: ic as u32,
+            oc: o_ch as u32,
+            residual: None,
+        });
     } else {
-        let use_mps = std::env::var("METAL_MPS").is_ok();
-        // Only use MPS for large GEMMs where the speedup exceeds encoder-switch overhead.
-        // Encoder switching costs ~0.2ms. MPS is ~1.3-2× faster.
-        // For a conv taking T ms on custom kernel, MPS takes T/1.5 ms but adds 0.2ms overhead.
-        // Break-even: T - T/1.5 > 0.2 → T > 0.6ms → ~300M FLOPs at M2's observed throughput.
-        let flops = (m * col_k * o_ch * 2) as u64;
-        let mps_threshold = 200_000_000u64; // 200 MFLOP threshold
-        if use_mps && flops >= mps_threshold {
-            // MPS-accelerated conv: im2col (for 3×3+) → MPS GEMM → bias+act
-            let is_1x1 = kh == 1 && kw == 1 && sh == 1 && sw == 1 && pads[0] == 0 && pads[1] == 0;
+        // Non-depthwise, non-Winograd conv: prefer MPS GEMM (Apple's tuned kernel).
+        // ConvGemm compute shaders are fallback only when MPS is disabled.
+        let use_mps = std::env::var("METAL_NO_MPS").is_err();
+        let is_1x1 = kh == 1 && kw == 1 && sh == 1 && sw == 1 && pads[0] == 0 && pads[1] == 0;
+        let use_direct = (col_k * o_ch) < 1024;
+
+        if use_mps && !use_direct {
+            // MPS-accelerated conv: im2col (for non-1×1) → MPS GEMM → bias+act
             let im2col_buf = if is_1x1 {
                 None
             } else {
-                // Allocate im2col buffer [M, K] f16
                 let im2col_name = format!("__mtl_im2col_{}", out_name);
                 bufs.insert(im2col_name.clone(), inf.output_buffer_f16(m * col_k));
                 Some(im2col_name)
@@ -169,146 +283,25 @@ pub(crate) fn record_conv(
                 pad_h: pads[0] as u32,
                 pad_w: pads[1] as u32,
             });
-        } else if sh == 1 && sw == 1 && kh == 3 && kw == 3 && group == 1 {
-            // Winograd F(4×4, 3×3) — 4× FLOP reduction for stride=1 3×3 convs.
-            let tile_h = oh.div_ceil(4);
-            let tile_w = ow.div_ceil(4);
-            let n_tiles = n * tile_h * tile_w;
-
-            // Pre-transform weights: [9*ic, oc] → [36, ic, oc] as f16
-            let wino_w_key = format!("__mtl_wino4_w_{}", node.inputs[1]);
-            if !bufs.contains_key(&wino_w_key) {
-                let w_khwc = if is_khwc {
-                    weight.clone()
-                } else {
-                    oihw_to_khwc_cout(weight)?
-                };
-                let wdata = w_khwc.data();
-                let expected = 9 * ic * o_ch;
-                if wdata.len() != expected {
-                    eprintln!(
-                        "  [winograd4] weight mismatch: {} '{}' w_shape={:?} is_khwc={} ic={} oc={} group={} data.len={} expected={}",
-                        node.op_type,
-                        node.name,
-                        w_khwc.shape(),
-                        is_khwc,
-                        ic,
-                        o_ch,
-                        group,
-                        wdata.len(),
-                        expected
-                    );
-                    ops.push(MetalOp::ConvGemm {
-                        input: input_name.clone(),
-                        weight: w_key,
-                        bias: b_key,
-                        output: out_name.clone(),
-                        params,
-                        f16io: true,
-                        residual: None,
-                    });
-                    return Ok(());
-                }
-                let transformed = winograd4x4_transform_weights_f16(wdata, ic, o_ch);
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        transformed.as_ptr() as *const u8,
-                        transformed.len() * 2,
-                    )
-                };
-                bufs.insert(
-                    wino_w_key.clone(),
-                    inf.device.new_buffer_with_data(
-                        bytes.as_ptr() as *const _,
-                        bytes.len() as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    ),
-                );
-            }
-
-            // Double-buffered Winograd temp buffers: alternate between set 0 and set 1
-            // to enable GPU pipelining between consecutive Winograd convolutions.
-            let ti_size = 36 * n_tiles * ic;
-            let go_size = 36 * n_tiles * o_ch;
-            let wino_count = ops
-                .iter()
-                .filter(|op| matches!(op, MetalOp::ConvWinograd { .. }))
-                .count();
-            let wino_set = wino_count % 2;
-            let ti_key = format!("__mtl_wino4_shared_ti_{}", wino_set);
-            let go_key = format!("__mtl_wino4_shared_go_{}", wino_set);
-            // Grow shared buffers to max needed size
-            if let Some(existing) = bufs.get(&ti_key) {
-                let existing_len = existing.length() as usize / 2; // f16 = 2 bytes
-                if ti_size > existing_len {
-                    bufs.insert(ti_key.clone(), inf.output_buffer_f16(ti_size));
-                }
-            } else {
-                bufs.insert(ti_key.clone(), inf.output_buffer_f16(ti_size));
-            }
-            if let Some(existing) = bufs.get(&go_key) {
-                let existing_len = existing.length() as usize / 2;
-                if go_size > existing_len {
-                    bufs.insert(go_key.clone(), inf.output_buffer_f16(go_size));
-                }
-            } else {
-                bufs.insert(go_key.clone(), inf.output_buffer_f16(go_size));
-            }
-
-            let wino_params = WinogradParams {
-                batch: n as u32,
-                ih: ih as u32,
-                iw: iw as u32,
-                ic: ic as u32,
-                oh: oh as u32,
-                ow: ow as u32,
-                oc: o_ch as u32,
-                pad_h: pads[0] as u32,
-                pad_w: pads[1] as u32,
-                tile_h: tile_h as u32,
-                tile_w: tile_w as u32,
-                n_tiles: n_tiles as u32,
-                act,
-                out_stride: o_ch as u32,
-                out_offset: 0,
-                in_stride: ic as u32,
-                in_offset: 0,
-            };
-            ops.push(MetalOp::ConvWinograd {
+        } else if use_direct {
+            ops.push(MetalOp::ConvDirect {
                 input: input_name.clone(),
-                weight: wino_w_key,
+                weight: w_key,
                 bias: b_key,
                 output: out_name.clone(),
-                transformed_input: ti_key,
-                gemm_output: go_key,
-                wino_params,
-                ic: ic as u32,
-                oc: o_ch as u32,
-                residual: None,
+                params,
+                f16io: true,
             });
         } else {
-            // Choose kernel: GEMM for large problems, direct for small.
-            let use_direct = (col_k * o_ch) < 1024;
-            if use_direct {
-                ops.push(MetalOp::ConvDirect {
-                    input: input_name.clone(),
-                    weight: w_key,
-                    bias: b_key,
-                    output: out_name.clone(),
-                    params,
-                    f16io: true,
-                });
-            } else {
-                ops.push(MetalOp::ConvGemm {
-                    input: input_name.clone(),
-                    weight: w_key,
-                    bias: b_key,
-                    output: out_name.clone(),
-                    params,
-                    f16io: true,
-                    residual: None,
-                });
-            }
+            ops.push(MetalOp::ConvGemm {
+                input: input_name.clone(),
+                weight: w_key,
+                bias: b_key,
+                output: out_name.clone(),
+                params,
+                f16io: true,
+                residual: None,
+            });
         }
     }
 

@@ -883,9 +883,9 @@ impl Backend for ThreadedCpuBackend {
     }
 }
 
-/// Backend-agnostic convenience call for add.
+/// Backend-agnostic convenience call for add (parallel by default).
 pub fn add(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, KernelError> {
-    CpuBackend.add(lhs, rhs)
+    ops::add_with_config(lhs, rhs, ParallelElementwiseConfig::default())
 }
 
 /// Backend-agnostic add with explicit elementwise parallelization heuristics.
@@ -897,9 +897,9 @@ pub fn add_with_config(
     ops::add_with_config(lhs, rhs, config)
 }
 
-/// Backend-agnostic convenience call for sub.
+/// Backend-agnostic convenience call for sub (parallel by default).
 pub fn sub(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, KernelError> {
-    CpuBackend.sub(lhs, rhs)
+    ops::sub_with_config(lhs, rhs, ParallelElementwiseConfig::default())
 }
 
 /// Backend-agnostic subtract with explicit elementwise parallelization heuristics.
@@ -911,9 +911,9 @@ pub fn sub_with_config(
     ops::sub_with_config(lhs, rhs, config)
 }
 
-/// Backend-agnostic convenience call for mul.
+/// Backend-agnostic convenience call for mul (parallel by default).
 pub fn mul(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, KernelError> {
-    CpuBackend.mul(lhs, rhs)
+    ops::mul_with_config(lhs, rhs, ParallelElementwiseConfig::default())
 }
 
 /// Backend-agnostic multiply with explicit elementwise parallelization heuristics.
@@ -925,9 +925,9 @@ pub fn mul_with_config(
     ops::mul_with_config(lhs, rhs, config)
 }
 
-/// Elementwise ReLU activation.
+/// Elementwise ReLU activation (parallel by default).
 pub fn relu(input: &Tensor) -> Tensor {
-    CpuBackend.relu(input)
+    ops::relu_with_config(input, ParallelElementwiseConfig::default())
 }
 
 /// In-place ReLU activation: clamps negative values to zero.
@@ -940,9 +940,9 @@ pub fn relu_with_config(input: &Tensor, config: ParallelElementwiseConfig) -> Te
     ops::relu_with_config(input, config)
 }
 
-/// Elementwise sigmoid activation.
+/// Elementwise sigmoid activation (parallel by default).
 pub fn sigmoid(input: &Tensor) -> Tensor {
-    CpuBackend.sigmoid(input)
+    ops::sigmoid_with_config(input, ParallelElementwiseConfig::default())
 }
 
 /// Elementwise sigmoid with explicit elementwise parallelization heuristics.
@@ -950,9 +950,9 @@ pub fn sigmoid_with_config(input: &Tensor, config: ParallelElementwiseConfig) ->
     ops::sigmoid_with_config(input, config)
 }
 
-/// Elementwise exp activation.
+/// Elementwise exp activation (parallel by default).
 pub fn exp(input: &Tensor) -> Tensor {
-    CpuBackend.exp(input)
+    ops::exp_with_config(input, ParallelElementwiseConfig::default())
 }
 
 /// Elementwise exp with explicit elementwise parallelization heuristics.
@@ -960,9 +960,9 @@ pub fn exp_with_config(input: &Tensor, config: ParallelElementwiseConfig) -> Ten
     ops::exp_with_config(input, config)
 }
 
-/// Elementwise tanh activation.
+/// Elementwise tanh activation (parallel by default).
 pub fn tanh_act(input: &Tensor) -> Tensor {
-    CpuBackend.tanh_act(input)
+    ops::tanh_act_with_config(input, ParallelElementwiseConfig::default())
 }
 
 /// Elementwise tanh with explicit elementwise parallelization heuristics.
@@ -990,9 +990,9 @@ pub fn mish(input: &Tensor) -> Tensor {
     ops::mish(input)
 }
 
-/// Softmax along the last tensor dimension.
+/// Softmax along the last tensor dimension (parallel by default).
 pub fn softmax_last_dim(input: &Tensor) -> Result<Tensor, KernelError> {
-    CpuBackend.softmax_last_dim(input)
+    ops::softmax_last_dim_with_config_and_pool(input, ParallelElementwiseConfig::default(), None)
 }
 
 /// Softmax along the last tensor dimension with explicit elementwise parallelization heuristics.
@@ -1003,9 +1003,13 @@ pub fn softmax_last_dim_with_config(
     ops::softmax_last_dim_with_config_and_pool(input, config, None)
 }
 
-/// Log-softmax along the last tensor dimension.
+/// Log-softmax along the last tensor dimension (parallel by default).
 pub fn log_softmax_last_dim(input: &Tensor) -> Result<Tensor, KernelError> {
-    CpuBackend.log_softmax_last_dim(input)
+    ops::log_softmax_last_dim_with_config_and_pool(
+        input,
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// Log-softmax along the last tensor dimension with explicit elementwise parallelization heuristics.
@@ -1020,7 +1024,7 @@ pub fn log_softmax_last_dim_with_config(
 ///
 /// Returns shape equal to input with the last dimension set to `1`.
 pub fn logsumexp_last_dim(input: &Tensor) -> Result<Tensor, KernelError> {
-    CpuBackend.logsumexp_last_dim(input)
+    ops::logsumexp_last_dim_with_config_and_pool(input, ParallelElementwiseConfig::default(), None)
 }
 
 /// Log-sum-exp reduction along the last tensor dimension with explicit elementwise parallelization heuristics.
@@ -1031,12 +1035,21 @@ pub fn logsumexp_last_dim_with_config(
     ops::logsumexp_last_dim_with_config_and_pool(input, config, None)
 }
 
-/// Layer normalization over the last tensor dimension.
+/// Layer normalization over the last tensor dimension (parallel by default).
 pub fn layer_norm_last_dim(
     input: &Tensor,
     params: LayerNormLastDimParams<'_>,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.layer_norm_last_dim(input, params)
+    ops::layer_norm_last_dim_with_config_and_pool(
+        input,
+        LayerNormLastDimTensors {
+            gamma: params.gamma,
+            beta: params.beta,
+            epsilon: params.epsilon,
+        },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// Layer normalization over the last tensor dimension with explicit elementwise parallelization heuristics.
@@ -1057,7 +1070,7 @@ pub fn layer_norm_last_dim_with_config(
     )
 }
 
-/// NHWC max-pooling without padding.
+/// NHWC max-pooling without padding (parallel by default).
 pub fn max_pool2d_nhwc(
     input: &Tensor,
     kernel_h: usize,
@@ -1065,7 +1078,17 @@ pub fn max_pool2d_nhwc(
     stride_h: usize,
     stride_w: usize,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.max_pool2d_nhwc(input, kernel_h, kernel_w, stride_h, stride_w)
+    ops::max_pool2d_nhwc_with_config_and_pool(
+        input,
+        Pool2dSpec {
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+        },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// NHWC max-pooling without padding with explicit parallelization heuristics.
@@ -1090,7 +1113,7 @@ pub fn max_pool2d_nhwc_with_config(
     )
 }
 
-/// NHWC average-pooling without padding.
+/// NHWC average-pooling without padding (parallel by default).
 pub fn avg_pool2d_nhwc(
     input: &Tensor,
     kernel_h: usize,
@@ -1098,7 +1121,17 @@ pub fn avg_pool2d_nhwc(
     stride_h: usize,
     stride_w: usize,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.avg_pool2d_nhwc(input, kernel_h, kernel_w, stride_h, stride_w)
+    ops::avg_pool2d_nhwc_with_config_and_pool(
+        input,
+        Pool2dSpec {
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+        },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// NHWC average-pooling without padding with explicit parallelization heuristics.
@@ -1123,7 +1156,7 @@ pub fn avg_pool2d_nhwc_with_config(
     )
 }
 
-/// NHWC convolution without padding using kernel shape `[KH, KW, C_in, C_out]`.
+/// NHWC convolution without padding using kernel shape `[KH, KW, C_in, C_out]` (parallel by default).
 pub fn conv2d_nhwc(
     input: &Tensor,
     kernel: &Tensor,
@@ -1131,7 +1164,14 @@ pub fn conv2d_nhwc(
     stride_h: usize,
     stride_w: usize,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.conv2d_nhwc(input, kernel, bias, stride_h, stride_w)
+    ops::conv2d_nhwc_with_config_and_pool(
+        input,
+        kernel,
+        bias,
+        Conv2dSpec { stride_h, stride_w },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// NHWC convolution with implicit zero-padding (avoids separate padded tensor allocation).
@@ -1189,7 +1229,7 @@ pub fn deformable_conv2d_nhwc(
     ops::deformable_conv2d_nhwc(input, weight, offsets, bias, stride, padding)
 }
 
-/// NHWC depthwise convolution without padding using kernel shape `[KH, KW, C, depth_multiplier]`.
+/// NHWC depthwise convolution without padding using kernel shape `[KH, KW, C, depth_multiplier]` (parallel by default).
 pub fn depthwise_conv2d_nhwc(
     input: &Tensor,
     kernel: &Tensor,
@@ -1197,7 +1237,14 @@ pub fn depthwise_conv2d_nhwc(
     stride_h: usize,
     stride_w: usize,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.depthwise_conv2d_nhwc(input, kernel, bias, stride_h, stride_w)
+    ops::depthwise_conv2d_nhwc_with_config_and_pool(
+        input,
+        kernel,
+        bias,
+        DepthwiseConv2dSpec { stride_h, stride_w },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// NHWC depthwise convolution without padding with explicit parallelization heuristics.
@@ -1219,7 +1266,7 @@ pub fn depthwise_conv2d_nhwc_with_config(
     )
 }
 
-/// NHWC separable convolution without padding:
+/// NHWC separable convolution without padding (parallel by default):
 /// depthwise (`[KH, KW, C, depth_multiplier]`) then pointwise (`[1, 1, C*depth_multiplier, C_out]`).
 pub fn separable_conv2d_nhwc(
     input: &Tensor,
@@ -1227,7 +1274,18 @@ pub fn separable_conv2d_nhwc(
     stride_h: usize,
     stride_w: usize,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.separable_conv2d_nhwc(input, params, stride_h, stride_w)
+    ops::separable_conv2d_nhwc_with_config_and_pool(
+        input,
+        SeparableConv2dKernels {
+            depthwise_kernel: params.depthwise_kernel,
+            depthwise_bias: params.depthwise_bias,
+            pointwise_kernel: params.pointwise_kernel,
+            pointwise_bias: params.pointwise_bias,
+        },
+        SeparableConv2dSpec { stride_h, stride_w },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// NHWC separable convolution without padding with explicit parallelization heuristics.
@@ -1252,13 +1310,24 @@ pub fn separable_conv2d_nhwc_with_config(
     )
 }
 
-/// NHWC per-channel batch normalization inference:
+/// NHWC per-channel batch normalization inference (parallel by default):
 /// `out = ((x - mean) / sqrt(variance + epsilon)) * gamma + beta`.
 pub fn batch_norm2d_nhwc(
     input: &Tensor,
     params: BatchNorm2dParams<'_>,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.batch_norm2d_nhwc(input, params)
+    ops::batch_norm2d_nhwc_with_config_and_pool(
+        input,
+        BatchNorm2dTensors {
+            gamma: params.gamma,
+            beta: params.beta,
+            mean: params.mean,
+            variance: params.variance,
+            epsilon: params.epsilon,
+        },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// NHWC per-channel batch normalization inference with explicit parallelization heuristics.
@@ -1281,12 +1350,22 @@ pub fn batch_norm2d_nhwc_with_config(
     )
 }
 
-/// NHWC group normalization: normalize within groups of channels.
+/// NHWC group normalization: normalize within groups of channels (parallel by default).
 pub fn group_norm_nhwc(
     input: &Tensor,
     params: GroupNormNhwcParams<'_>,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.group_norm_nhwc(input, params)
+    ops::group_norm_nhwc_with_config_and_pool(
+        input,
+        GroupNorm2dTensors {
+            gamma: params.gamma,
+            beta: params.beta,
+            num_groups: params.num_groups,
+            epsilon: params.epsilon,
+        },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// NHWC group normalization with explicit parallelization heuristics.
@@ -1308,12 +1387,20 @@ pub fn group_norm_nhwc_with_config(
     )
 }
 
-/// RMS normalization over the last tensor dimension.
+/// RMS normalization over the last tensor dimension (parallel by default).
 pub fn rms_norm_last_dim(
     input: &Tensor,
     params: RmsNormLastDimParams<'_>,
 ) -> Result<Tensor, KernelError> {
-    CpuBackend.rms_norm_last_dim(input, params)
+    ops::rms_norm_last_dim_with_config_and_pool(
+        input,
+        RmsNormLastDimTensors {
+            gamma: params.gamma,
+            epsilon: params.epsilon,
+        },
+        ParallelElementwiseConfig::default(),
+        None,
+    )
 }
 
 /// RMS normalization over the last tensor dimension with explicit parallelization heuristics.
@@ -1335,7 +1422,7 @@ pub fn rms_norm_last_dim_with_config(
 
 /// Deterministic rank-2 matrix multiplication: `(m x k) * (k x n) -> (m x n)`.
 pub fn matmul_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor, KernelError> {
-    CpuBackend.matmul_2d(lhs, rhs)
+    ops::matmul_2d(lhs, rhs)
 }
 
 /// Zero-copy slice-based matmul: C[m×n] = A[m×k] × B[k×n].

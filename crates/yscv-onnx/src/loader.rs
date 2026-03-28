@@ -47,6 +47,8 @@ pub struct OnnxModel {
     pub nodes: Vec<OnnxNode>,
     /// Conv weight names that were pre-permuted OIHW → KHWC at load time.
     pub(crate) khwc_weights: HashSet<String>,
+    /// Depthwise conv weight names pre-permuted [O,1,KH,KW] → [KH,KW,C,dm] at load time.
+    pub(crate) dw_khwc_weights: HashSet<String>,
 }
 
 impl OnnxModel {
@@ -145,6 +147,13 @@ pub fn load_onnx_model(data: &[u8]) -> Result<OnnxModel, OnnxError> {
         }
     }
 
+    // Note: depthwise conv weights stay in OIHW [O, 1, KH, KW] format.
+    // They are repacked to [KH, KW, C, depth_mult] at runtime in the CPU
+    // runner. Pre-permutation was reverted because the Metal GPU pipeline
+    // uses the OIHW→KHWC conversion path and its DepthwiseConv kernel
+    // expects the standard layout.
+    let dw_khwc_weights = HashSet::new();
+
     Ok(OnnxModel {
         ir_version: model_proto.ir_version.unwrap_or(0),
         opset_version,
@@ -155,6 +164,7 @@ pub fn load_onnx_model(data: &[u8]) -> Result<OnnxModel, OnnxError> {
         initializers,
         nodes,
         khwc_weights,
+        dw_khwc_weights,
     })
 }
 

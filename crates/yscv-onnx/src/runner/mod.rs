@@ -2,7 +2,7 @@ pub(crate) use std::collections::{HashMap, HashSet};
 
 pub(crate) use yscv_kernels::{
     BatchNorm2dParams, add as kernel_add, avg_pool2d_nhwc, batch_norm2d_nhwc, conv2d_nhwc,
-    matmul_2d, matmul_2d_slices, max_pool2d_nhwc, mul as kernel_mul, relu, sigmoid,
+    matmul_2d, matmul_2d_slices, max_pool2d_nhwc, mul as kernel_mul, relu, relu_inplace, sigmoid,
     softmax_last_dim, sub as kernel_sub,
 };
 pub(crate) use yscv_tensor::{DType, Tensor};
@@ -51,6 +51,10 @@ pub(crate) struct TensorEnv<'m> {
     nhwc_flags: Vec<bool>,
     /// Slot IDs whose tensors have been pre-permuted from OIHW to KHWC.
     khwc_weights: HashSet<usize>,
+    /// Slot IDs whose depthwise weights were pre-permuted [O,1,KH,KW] → [KH,KW,C,dm].
+    /// Currently unused (pre-permutation reverted), kept for forward compatibility.
+    #[allow(dead_code)]
+    dw_khwc_weights: HashSet<usize>,
     /// Counter for dynamically allocated temporary names that were not in
     /// the pre-built mapping (e.g., "__qa", "__qb_mat").
     next_dynamic: usize,
@@ -91,12 +95,18 @@ impl<'m> TensorEnv<'m> {
             .iter()
             .filter_map(|name| name_to_id.get(name.as_str()).copied())
             .collect();
+        let dw_khwc_ids: HashSet<usize> = model
+            .dw_khwc_weights
+            .iter()
+            .filter_map(|name| name_to_id.get(name.as_str()).copied())
+            .collect();
         TensorEnv {
             next_dynamic: num_slots,
             name_to_id,
             slots: vec![None; num_slots],
             nhwc_flags: vec![false; num_slots],
             khwc_weights: khwc_ids,
+            dw_khwc_weights: dw_khwc_ids,
             initializers: &model.initializers,
         }
     }
@@ -182,6 +192,17 @@ impl<'m> TensorEnv<'m> {
         self.name_to_id
             .get(name)
             .is_some_and(|&id| self.khwc_weights.contains(&id))
+    }
+
+    /// Returns true if the depthwise conv weight has been pre-permuted to
+    /// `[KH, KW, C, depth_multiplier]` format at load time.
+    /// Currently unused (pre-permutation reverted), kept for forward compatibility.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn is_dw_khwc_weight(&self, name: &str) -> bool {
+        self.name_to_id
+            .get(name)
+            .is_some_and(|&id| self.dw_khwc_weights.contains(&id))
     }
 
     /// Create a zero-copy alias: remap `alias_name` to the same slot as
@@ -379,9 +400,7 @@ pub fn run_onnx_model(
             execute_node_with_layout(node, &mut env)?;
             execute_node_with_layout(next, &mut env)?;
             if let Some(tensor) = env.get_mut(&next.outputs[0]) {
-                for v in tensor.data_mut() {
-                    *v = v.max(0.0);
-                }
+                relu_inplace(tensor);
             }
             env.alias(&next2.outputs[0], &next.outputs[0]);
             skip.insert(i + 1);
@@ -398,9 +417,7 @@ pub fn run_onnx_model(
         {
             execute_node_with_layout(node, &mut env)?;
             if let Some(tensor) = env.get_mut(&node.outputs[0]) {
-                for v in tensor.data_mut() {
-                    *v = v.max(0.0);
-                }
+                relu_inplace(tensor);
             }
             env.alias(&next.outputs[0], &node.outputs[0]);
             skip.insert(i + 1);
@@ -477,9 +494,7 @@ pub fn run_onnx_model(
         {
             execute_node_with_layout(node, &mut env)?;
             if let Some(tensor) = env.get_mut(&node.outputs[0]) {
-                for v in tensor.data_mut() {
-                    *v = v.max(0.0);
-                }
+                relu_inplace(tensor);
             }
             env.alias(&next.outputs[0], &node.outputs[0]);
             skip.insert(i + 1);
@@ -495,9 +510,7 @@ pub fn run_onnx_model(
         {
             execute_node_with_layout(node, &mut env)?;
             if let Some(tensor) = env.get_mut(&node.outputs[0]) {
-                for v in tensor.data_mut() {
-                    *v = v.max(0.0);
-                }
+                relu_inplace(tensor);
             }
             env.alias(&next.outputs[0], &node.outputs[0]);
             skip.insert(i + 1);
@@ -513,9 +526,7 @@ pub fn run_onnx_model(
         {
             execute_node_with_layout(node, &mut env)?;
             if let Some(tensor) = env.get_mut(&node.outputs[0]) {
-                for v in tensor.data_mut() {
-                    *v = v.max(0.0);
-                }
+                relu_inplace(tensor);
             }
             env.alias(&next.outputs[0], &node.outputs[0]);
             skip.insert(i + 1);

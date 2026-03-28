@@ -78,8 +78,8 @@ pub fn compile_metal_plan(
             input_shape[2],
             input_shape[3],
         );
-        // Allocate f16 NHWC buffer directly — CPU writes f16 at runtime
-        let input_f16_buf = inf.output_buffer_f16(input_n);
+        // Allocate f16 NHWC buffer — Shared because CPU writes at runtime
+        let input_f16_buf = inf.output_buffer_f16_shared(input_n);
         bufs.insert(input_name.to_string(), input_f16_buf);
         buf_shapes.insert(input_name.to_string(), vec![n_dim, h, w, c]);
         buf_nhwc.insert(input_name.to_string(), true);

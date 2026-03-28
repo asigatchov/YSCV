@@ -467,19 +467,26 @@ pub mod metal_conv {
                 .new_buffer(len as u64, MTLResourceOptions::StorageModeShared)
         }
 
-        /// Allocate a buffer for f16 elements (2 bytes each). Half the size of f32.
+        /// Allocate an f16 buffer for intermediates. Uses StorageModeShared
+        /// (unified memory on Apple Silicon — no copy overhead, CPU-accessible
+        /// for debugging).
         pub fn output_buffer_f16(&self, num_f16: usize) -> Buffer {
             let len = if num_f16 == 0 { 4 } else { num_f16 * 2 };
             self.device
                 .new_buffer(len as u64, MTLResourceOptions::StorageModeShared)
         }
 
-        /// Allocate a GPU-private f16 buffer. Faster for GPU-only intermediates
-        /// (no CPU coherence overhead). Cannot be read from CPU.
-        pub fn output_buffer_f16_private(&self, num_f16: usize) -> Buffer {
+        /// Allocate a CPU-accessible f16 buffer. Use for input upload and
+        /// output readback (anywhere CPU needs to read/write the buffer).
+        pub fn output_buffer_f16_shared(&self, num_f16: usize) -> Buffer {
             let len = if num_f16 == 0 { 4 } else { num_f16 * 2 };
             self.device
-                .new_buffer(len as u64, MTLResourceOptions::StorageModePrivate)
+                .new_buffer(len as u64, MTLResourceOptions::StorageModeShared)
+        }
+
+        /// Allocate a GPU-private f16 buffer. Alias for output_buffer_f16.
+        pub fn output_buffer_f16_private(&self, num_f16: usize) -> Buffer {
+            self.output_buffer_f16(num_f16)
         }
 
         pub fn read_buffer_f32(&self, buf: &Buffer, count: usize) -> Vec<f32> {
@@ -3073,5 +3080,715 @@ pub mod metal_conv {
             let ptr = buf.contents() as *const f32;
             unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
         }
+    }
+}
+
+// ── MPSGraph-based whole-model inference ──
+// Builds a MetalPerformanceShadersGraph for the entire model, then executes
+// the graph as a single GPU dispatch — eliminating per-op encoder transitions.
+
+#[cfg(all(target_os = "macos", feature = "metal-backend"))]
+#[allow(unexpected_cfgs)]
+pub mod mpsgraph {
+    use foreign_types::ForeignTypeRef as _;
+    use metal::*;
+    use objc::rc::autoreleasepool;
+    use objc::runtime::{Class, NO, Object, YES};
+    use objc::{msg_send, sel, sel_impl};
+
+    // MPSDataType constants
+    pub const MPS_DATA_TYPE_FLOAT16: u32 = 0x10000000 | 16;
+    pub const MPS_DATA_TYPE_FLOAT32: u32 = 0x10000000 | 32;
+
+    /// Wraps an MPSGraph pointer with a safe Rust interface.
+    pub struct MpsGraph {
+        pub(crate) graph: *mut Object,
+    }
+
+    impl Drop for MpsGraph {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.graph, release];
+            }
+        }
+    }
+
+    /// Wraps an MPSGraphTensor pointer (graph node output).
+    #[derive(Clone, Copy)]
+    pub struct MpsGraphTensorRef {
+        pub(crate) ptr: *mut Object,
+    }
+
+    /// Wraps a compiled MPSGraphExecutable for repeated inference.
+    pub struct MpsGraphExecutable {
+        pub(crate) exe: *mut Object,
+    }
+
+    impl Drop for MpsGraphExecutable {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.exe, release];
+            }
+        }
+    }
+
+    /// Descriptor for Conv2d parameters.
+    pub struct Conv2dDesc {
+        pub stride_h: usize,
+        pub stride_w: usize,
+        pub dilation_h: usize,
+        pub dilation_w: usize,
+        pub pad_top: usize,
+        pub pad_bottom: usize,
+        pub pad_left: usize,
+        pub pad_right: usize,
+        pub groups: usize,
+    }
+
+    /// Descriptor for Pool2d parameters.
+    pub struct Pool2dDesc {
+        pub kernel_h: usize,
+        pub kernel_w: usize,
+        pub stride_h: usize,
+        pub stride_w: usize,
+        pub pad_top: usize,
+        pub pad_bottom: usize,
+        pub pad_left: usize,
+        pub pad_right: usize,
+    }
+
+    // Helper: create NSArray from a &[i64] shape
+    unsafe fn ns_array_from_shape(shape: &[i64]) -> *mut Object {
+        let ns_number_cls = Class::get("NSNumber").unwrap();
+        let ns_array_cls = Class::get("NSArray").unwrap();
+
+        // Build NSNumber objects
+        let mut numbers: Vec<*mut Object> = Vec::with_capacity(shape.len());
+        for &dim in shape {
+            let n: *mut Object = msg_send![ns_number_cls, numberWithLongLong: dim];
+            numbers.push(n);
+        }
+        let arr: *mut Object = msg_send![ns_array_cls,
+            arrayWithObjects: numbers.as_ptr()
+            count: numbers.len()];
+        arr
+    }
+
+    // Helper: create NSArray from a &[usize] shape (converts to i64)
+    unsafe fn ns_array_from_usize(shape: &[usize]) -> *mut Object {
+        let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+        unsafe { ns_array_from_shape(&dims) }
+    }
+
+    impl MpsGraph {
+        /// Create a new empty MPSGraph.
+        pub fn new() -> Option<Self> {
+            unsafe {
+                let cls = Class::get("MPSGraph")?;
+                let graph: *mut Object = msg_send![cls, new];
+                if graph.is_null() {
+                    return None;
+                }
+                Some(MpsGraph { graph })
+            }
+        }
+
+        /// Create a placeholder input tensor (NCHW layout, f16).
+        pub fn placeholder_f16(&self, shape: &[usize], name: &str) -> MpsGraphTensorRef {
+            unsafe {
+                let shape_arr = ns_array_from_usize(shape);
+                let ns_name = ns_string(name);
+                let tensor: *mut Object = msg_send![self.graph,
+                    placeholderWithShape: shape_arr
+                    dataType: MPS_DATA_TYPE_FLOAT16
+                    name: ns_name];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Create a placeholder input tensor (NCHW layout, f32).
+        pub fn placeholder_f32(&self, shape: &[usize], name: &str) -> MpsGraphTensorRef {
+            unsafe {
+                let shape_arr = ns_array_from_usize(shape);
+                let ns_name = ns_string(name);
+                let tensor: *mut Object = msg_send![self.graph,
+                    placeholderWithShape: shape_arr
+                    dataType: MPS_DATA_TYPE_FLOAT32
+                    name: ns_name];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Create a constant tensor from f16 data (NCHW layout).
+        pub fn constant_f16(&self, data: &[u16], shape: &[usize]) -> MpsGraphTensorRef {
+            unsafe {
+                let shape_arr = ns_array_from_usize(shape);
+                let ns_data = ns_data_from_bytes(data.as_ptr() as *const u8, data.len() * 2);
+                let tensor: *mut Object = msg_send![self.graph,
+                    constantWithData: ns_data
+                    shape: shape_arr
+                    dataType: MPS_DATA_TYPE_FLOAT16];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Create a constant tensor from f32 data.
+        pub fn constant_f32(&self, data: &[f32], shape: &[usize]) -> MpsGraphTensorRef {
+            unsafe {
+                let shape_arr = ns_array_from_usize(shape);
+                let ns_data = ns_data_from_bytes(data.as_ptr() as *const u8, data.len() * 4);
+                let tensor: *mut Object = msg_send![self.graph,
+                    constantWithData: ns_data
+                    shape: shape_arr
+                    dataType: MPS_DATA_TYPE_FLOAT32];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Cast tensor to f16.
+        pub fn cast_to_f16(&self, input: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let ns_name = ns_string("cast_f16");
+                let tensor: *mut Object = msg_send![self.graph,
+                    castTensor: input.ptr
+                    toType: MPS_DATA_TYPE_FLOAT16
+                    name: ns_name];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Cast tensor to f32.
+        pub fn cast_to_f32(&self, input: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let ns_name = ns_string("cast_f32");
+                let tensor: *mut Object = msg_send![self.graph,
+                    castTensor: input.ptr
+                    toType: MPS_DATA_TYPE_FLOAT32
+                    name: ns_name];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Conv2d: input [N,C,H,W] f16, weights [O,I/g,kH,kW] f16.
+        /// MPSGraph expects NCHW layout with OIHW weights.
+        pub fn conv2d(
+            &self,
+            input: MpsGraphTensorRef,
+            weights: MpsGraphTensorRef,
+            desc: &Conv2dDesc,
+        ) -> MpsGraphTensorRef {
+            unsafe {
+                let conv_desc_cls = Class::get("MPSGraphConvolution2DOpDescriptor").unwrap();
+                let d: *mut Object = msg_send![conv_desc_cls,
+                    descriptorWithStrideInX: desc.stride_w as u64
+                    strideInY: desc.stride_h as u64
+                    dilationRateInX: desc.dilation_w as u64
+                    dilationRateInY: desc.dilation_h as u64
+                    groups: desc.groups as u64
+                    paddingLeft: desc.pad_left as u64
+                    paddingRight: desc.pad_right as u64
+                    paddingTop: desc.pad_top as u64
+                    paddingBottom: desc.pad_bottom as u64
+                    paddingStyle: 0u64  // explicit padding
+                    dataLayout: 0u64    // NCHW
+                    weightsLayout: 2u64]; // OIHW
+
+                let tensor: *mut Object = msg_send![self.graph,
+                    convolution2DWithSourceTensor: input.ptr
+                    weightsTensor: weights.ptr
+                    descriptor: d
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Depthwise conv2d (groups == in_channels == out_channels).
+        /// Weights shape for MPSGraph depthwise: [out_ch, 1, kH, kW] with groups=out_ch.
+        pub fn depthwise_conv2d(
+            &self,
+            input: MpsGraphTensorRef,
+            weights: MpsGraphTensorRef,
+            desc: &Conv2dDesc,
+        ) -> MpsGraphTensorRef {
+            // Same as conv2d — MPSGraph handles depthwise when groups == in_channels
+            self.conv2d(input, weights, desc)
+        }
+
+        /// Add bias to conv output. Input [N,C,H,W], bias [C] → broadcast add.
+        pub fn add_bias(
+            &self,
+            input: MpsGraphTensorRef,
+            bias: MpsGraphTensorRef,
+        ) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    additionWithPrimaryTensor: input.ptr
+                    secondaryTensor: bias.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Element-wise addition.
+        pub fn add(&self, a: MpsGraphTensorRef, b: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    additionWithPrimaryTensor: a.ptr
+                    secondaryTensor: b.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Element-wise subtraction.
+        pub fn sub(&self, a: MpsGraphTensorRef, b: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    subtractionWithPrimaryTensor: a.ptr
+                    secondaryTensor: b.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Element-wise multiplication.
+        pub fn mul(&self, a: MpsGraphTensorRef, b: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    multiplicationWithPrimaryTensor: a.ptr
+                    secondaryTensor: b.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Element-wise division.
+        pub fn div(&self, a: MpsGraphTensorRef, b: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    divisionWithPrimaryTensor: a.ptr
+                    secondaryTensor: b.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// ReLU activation.
+        pub fn relu(&self, input: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    reLUWithTensor: input.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Sigmoid activation.
+        pub fn sigmoid(&self, input: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    sigmoidWithTensor: input.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// SiLU = x * sigmoid(x).
+        pub fn silu(&self, input: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            let sig = self.sigmoid(input);
+            self.mul(input, sig)
+        }
+
+        /// MaxPool2d: NCHW layout.
+        pub fn max_pool2d(&self, input: MpsGraphTensorRef, desc: &Pool2dDesc) -> MpsGraphTensorRef {
+            unsafe {
+                let pool_desc_cls = Class::get("MPSGraphPooling2DOpDescriptor").unwrap();
+                let d: *mut Object = msg_send![pool_desc_cls,
+                    descriptorWithKernelWidth: desc.kernel_w as u64
+                    kernelHeight: desc.kernel_h as u64
+                    strideInX: desc.stride_w as u64
+                    strideInY: desc.stride_h as u64
+                    dilationRateInX: 1u64
+                    dilationRateInY: 1u64
+                    paddingLeft: desc.pad_left as u64
+                    paddingRight: desc.pad_right as u64
+                    paddingTop: desc.pad_top as u64
+                    paddingBottom: desc.pad_bottom as u64
+                    paddingStyle: 0u64  // explicit
+                    dataLayout: 0u64]; // NCHW
+
+                let tensor: *mut Object = msg_send![self.graph,
+                    maxPooling2DWithSourceTensor: input.ptr
+                    descriptor: d
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// AvgPool2d: NCHW layout.
+        pub fn avg_pool2d(&self, input: MpsGraphTensorRef, desc: &Pool2dDesc) -> MpsGraphTensorRef {
+            unsafe {
+                let pool_desc_cls = Class::get("MPSGraphPooling2DOpDescriptor").unwrap();
+                let d: *mut Object = msg_send![pool_desc_cls,
+                    descriptorWithKernelWidth: desc.kernel_w as u64
+                    kernelHeight: desc.kernel_h as u64
+                    strideInX: desc.stride_w as u64
+                    strideInY: desc.stride_h as u64
+                    dilationRateInX: 1u64
+                    dilationRateInY: 1u64
+                    paddingLeft: desc.pad_left as u64
+                    paddingRight: desc.pad_right as u64
+                    paddingTop: desc.pad_top as u64
+                    paddingBottom: desc.pad_bottom as u64
+                    paddingStyle: 0u64
+                    dataLayout: 0u64];
+
+                // Set countIncludesPadding to NO for standard avg pool
+                let _: () = msg_send![d, setCountIncludesZeroPadding: NO];
+
+                let tensor: *mut Object = msg_send![self.graph,
+                    avgPooling2DWithSourceTensor: input.ptr
+                    descriptor: d
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Global average pooling: reduce H and W dims. Input [N,C,H,W] → [N,C,1,1].
+        pub fn global_avg_pool(&self, input: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                // Reduce mean over axes [2, 3] (H, W in NCHW)
+                let axes = ns_array_from_shape(&[2i64, 3i64]);
+                let tensor: *mut Object = msg_send![self.graph,
+                    meanOfTensor: input.ptr
+                    axes: axes
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Batch normalization: input [N,C,H,W], mean/var/gamma/beta [C].
+        pub fn batch_norm(
+            &self,
+            input: MpsGraphTensorRef,
+            mean: MpsGraphTensorRef,
+            variance: MpsGraphTensorRef,
+            gamma: MpsGraphTensorRef,
+            beta: MpsGraphTensorRef,
+            epsilon: f32,
+        ) -> MpsGraphTensorRef {
+            unsafe {
+                // (x - mean) / sqrt(var + eps) * gamma + beta
+                let eps_tensor = self.constant_scalar_f32(epsilon);
+                let var_eps: *mut Object = msg_send![self.graph,
+                    additionWithPrimaryTensor: variance.ptr
+                    secondaryTensor: eps_tensor.ptr
+                    name: std::ptr::null::<Object>()];
+                let std_dev: *mut Object = msg_send![self.graph,
+                    squareRootWithTensor: var_eps
+                    name: std::ptr::null::<Object>()];
+                let centered: *mut Object = msg_send![self.graph,
+                    subtractionWithPrimaryTensor: input.ptr
+                    secondaryTensor: mean.ptr
+                    name: std::ptr::null::<Object>()];
+                let normed: *mut Object = msg_send![self.graph,
+                    divisionWithPrimaryTensor: centered
+                    secondaryTensor: std_dev
+                    name: std::ptr::null::<Object>()];
+                let scaled: *mut Object = msg_send![self.graph,
+                    multiplicationWithPrimaryTensor: normed
+                    secondaryTensor: gamma.ptr
+                    name: std::ptr::null::<Object>()];
+                let result: *mut Object = msg_send![self.graph,
+                    additionWithPrimaryTensor: scaled
+                    secondaryTensor: beta.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: result }
+            }
+        }
+
+        /// Softmax along a given axis.
+        pub fn softmax(&self, input: MpsGraphTensorRef, axis: i64) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    softMaxWithTensor: input.ptr
+                    axis: axis
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Reshape tensor to new shape.
+        pub fn reshape(&self, input: MpsGraphTensorRef, shape: &[i64]) -> MpsGraphTensorRef {
+            unsafe {
+                let shape_arr = ns_array_from_shape(shape);
+                let tensor: *mut Object = msg_send![self.graph,
+                    reshapeTensor: input.ptr
+                    withShape: shape_arr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Transpose (permute) dimensions.
+        pub fn transpose(
+            &self,
+            input: MpsGraphTensorRef,
+            dim0: usize,
+            dim1: usize,
+        ) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    transposeTensor: input.ptr
+                    dimension: dim0 as u64
+                    withDimension: dim1 as u64
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Concat tensors along a given axis.
+        pub fn concat(&self, tensors: &[MpsGraphTensorRef], axis: i64) -> MpsGraphTensorRef {
+            unsafe {
+                let ns_array_cls = Class::get("NSArray").unwrap();
+                let ptrs: Vec<*mut Object> = tensors.iter().map(|t| t.ptr).collect();
+                let arr: *mut Object = msg_send![ns_array_cls,
+                    arrayWithObjects: ptrs.as_ptr()
+                    count: ptrs.len()];
+                let tensor: *mut Object = msg_send![self.graph,
+                    concatTensors: arr
+                    dimension: axis
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Slice (StridedSlice) for Split-like operations.
+        pub fn slice(
+            &self,
+            input: MpsGraphTensorRef,
+            starts: &[i64],
+            ends: &[i64],
+            strides: &[i64],
+        ) -> MpsGraphTensorRef {
+            unsafe {
+                let starts_arr = ns_array_from_shape(starts);
+                let ends_arr = ns_array_from_shape(ends);
+                let strides_arr = ns_array_from_shape(strides);
+                let tensor: *mut Object = msg_send![self.graph,
+                    sliceTensor: input.ptr
+                    starts: starts_arr
+                    ends: ends_arr
+                    strides: strides_arr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// MatMul: [M, K] x [K, N] → [M, N].
+        pub fn matmul(&self, a: MpsGraphTensorRef, b: MpsGraphTensorRef) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    matrixMultiplicationWithPrimaryTensor: a.ptr
+                    secondaryTensor: b.ptr
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Resize nearest-neighbor (upsampling).
+        pub fn resize_nearest(
+            &self,
+            input: MpsGraphTensorRef,
+            out_h: usize,
+            out_w: usize,
+        ) -> MpsGraphTensorRef {
+            unsafe {
+                let size_arr = ns_array_from_shape(&[out_h as i64, out_w as i64]);
+                // MPSGraphResizeMode: nearest=0, bilinear=1
+                let tensor: *mut Object = msg_send![self.graph,
+                    resizeTensor: input.ptr
+                    size: size_arr
+                    mode: 0u64  // nearest
+                    centerResult: YES
+                    alignCorners: NO
+                    layout: 0u64  // NCHW
+                    name: std::ptr::null::<Object>()];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Create a scalar f32 constant.
+        fn constant_scalar_f32(&self, val: f32) -> MpsGraphTensorRef {
+            unsafe {
+                let tensor: *mut Object = msg_send![self.graph,
+                    constantWithScalar: val as f64
+                    dataType: MPS_DATA_TYPE_FLOAT32];
+                MpsGraphTensorRef { ptr: tensor }
+            }
+        }
+
+        /// Compile the graph into an executable for repeated inference.
+        /// `feeds` maps placeholder tensor → shape + datatype for each input.
+        /// `target_tensors` is the list of output tensors.
+        pub fn compile(
+            &self,
+            device: &Device,
+            feeds: &[(MpsGraphTensorRef, &[usize], u32)], // (placeholder, shape, datatype)
+            target_tensors: &[MpsGraphTensorRef],
+        ) -> Option<MpsGraphExecutable> {
+            unsafe {
+                // Build feeds dictionary: MPSGraphTensor → MPSGraphShapedType
+                let ns_dict_cls = Class::get("NSMutableDictionary").unwrap();
+                let feeds_dict: *mut Object = msg_send![ns_dict_cls, new];
+
+                let shaped_type_cls = Class::get("MPSGraphShapedType").unwrap();
+                for &(ref tensor, shape, dtype) in feeds {
+                    let shape_arr = ns_array_from_usize(shape);
+                    let shaped: *mut Object = msg_send![shaped_type_cls, alloc];
+                    let shaped: *mut Object = msg_send![shaped,
+                        initWithShape: shape_arr
+                        dataType: dtype];
+                    let _: () = msg_send![feeds_dict,
+                        setObject: shaped
+                        forKey: tensor.ptr];
+                    let _: () = msg_send![shaped, release];
+                }
+
+                // Build targets NSArray
+                let ns_array_cls = Class::get("NSArray").unwrap();
+                let target_ptrs: Vec<*mut Object> = target_tensors.iter().map(|t| t.ptr).collect();
+                let targets: *mut Object = msg_send![ns_array_cls,
+                    arrayWithObjects: target_ptrs.as_ptr()
+                    count: target_ptrs.len()];
+
+                // Compilation descriptor (optional optimizations)
+                let comp_desc_cls = Class::get("MPSGraphCompilationDescriptor").unwrap();
+                let comp_desc: *mut Object = msg_send![comp_desc_cls, new];
+                // optimization level 1 = default optimization
+                let _: () = msg_send![comp_desc,
+                    setOptimizationLevel: 1u64];
+
+                // Create MPSGraphDevice from MTLDevice
+                let mpsg_device_cls = Class::get("MPSGraphDevice").unwrap();
+                let mpsg_device: *mut Object = msg_send![mpsg_device_cls,
+                    deviceWithMTLDevice: device.as_ptr()];
+
+                // Compile
+                let exe: *mut Object = msg_send![self.graph,
+                    compileWithDevice: mpsg_device
+                    feeds: feeds_dict
+                    targetTensors: targets
+                    targetOperations: std::ptr::null::<Object>()
+                    compilationDescriptor: comp_desc];
+
+                let _: () = msg_send![comp_desc, release];
+                let _: () = msg_send![feeds_dict, release];
+
+                if exe.is_null() {
+                    return None;
+                }
+                // exe is autoreleased; retain it
+                let _: () = msg_send![exe, retain];
+                Some(MpsGraphExecutable { exe })
+            }
+        }
+
+        /// Run the graph with Metal buffers as input.
+        /// Returns output data as raw bytes in the order of `target_tensors`.
+        pub fn run_with_buffers(
+            &self,
+            executable: &MpsGraphExecutable,
+            queue: &CommandQueue,
+            inputs: &[(MpsGraphTensorRef, &Buffer, &[usize], u32)], // (placeholder, buffer, shape, dtype)
+        ) -> Vec<Buffer> {
+            unsafe {
+                autoreleasepool(|| {
+                    // Build inputsArray: [MPSGraphTensorData]
+                    let tensor_data_cls = Class::get("MPSGraphTensorData").unwrap();
+                    let ns_array_cls = Class::get("NSArray").unwrap();
+
+                    let mut input_datas: Vec<*mut Object> = Vec::new();
+                    for &(_, buf, shape, dtype) in inputs {
+                        let shape_arr = ns_array_from_usize(shape);
+                        let alloc: *mut Object = msg_send![tensor_data_cls, alloc];
+                        let td: *mut Object = msg_send![alloc,
+                            initWithMTLBuffer: buf.as_ptr()
+                            shape: shape_arr
+                            dataType: dtype];
+                        input_datas.push(td);
+                    }
+                    let inputs_arr: *mut Object = msg_send![ns_array_cls,
+                        arrayWithObjects: input_datas.as_ptr()
+                        count: input_datas.len()];
+
+                    // Execute
+                    let results: *mut Object = msg_send![executable.exe,
+                        runWithMTLCommandQueue: queue.as_ptr()
+                        inputsArray: inputs_arr
+                        resultsArray: std::ptr::null::<Object>()
+                        executionDescriptor: std::ptr::null::<Object>()];
+
+                    // Extract output buffers
+                    let count: u64 = msg_send![results, count];
+                    let mut out_bufs = Vec::new();
+                    for i in 0..count {
+                        let td: *mut Object = msg_send![results, objectAtIndex: i];
+                        // MPSGraphTensorData.mpsndarray returns an MPSNDArray.
+                        // We read data from it into a shared buffer.
+                        let nd_array: *mut Object = msg_send![td, mpsndarray];
+                        // Get total bytes
+                        let n_dims: u64 = msg_send![nd_array, numberOfDimensions];
+                        let mut total_elements: u64 = 1;
+                        for d in 0..n_dims {
+                            let dim_size: u64 = msg_send![nd_array, lengthOfDimension: d];
+                            total_elements *= dim_size;
+                        }
+                        // dataType from nd_array
+                        let dtype: u32 = msg_send![nd_array, dataType];
+                        let bytes_per_elem = if dtype == MPS_DATA_TYPE_FLOAT16 {
+                            2u64
+                        } else {
+                            4u64
+                        };
+                        let total_bytes = total_elements * bytes_per_elem;
+
+                        // Read into a new shared buffer
+                        let mtl_device: &DeviceRef = queue.device();
+                        let out_buf = mtl_device
+                            .new_buffer(total_bytes, MTLResourceOptions::StorageModeShared);
+                        let _: () = msg_send![nd_array,
+                            readBytes: out_buf.contents()
+                            strideBytes: std::ptr::null::<Object>()];
+
+                        out_bufs.push(out_buf);
+                    }
+
+                    // Release input tensor datas
+                    for td in &input_datas {
+                        let _: () = msg_send![*td, release];
+                    }
+
+                    out_bufs
+                })
+            }
+        }
+    }
+
+    // Helper: create NSString from &str
+    unsafe fn ns_string(s: &str) -> *mut Object {
+        let ns_string_cls = Class::get("NSString").unwrap();
+        let ns_str: *mut Object = msg_send![ns_string_cls,
+            stringWithUTF8String: s.as_ptr() as *const i8];
+        ns_str
+    }
+
+    // Helper: create NSData from raw bytes
+    unsafe fn ns_data_from_bytes(ptr: *const u8, len: usize) -> *mut Object {
+        let ns_data_cls = Class::get("NSData").unwrap();
+        let data: *mut Object = msg_send![ns_data_cls,
+            dataWithBytes: ptr
+            length: len];
+        data
     }
 }

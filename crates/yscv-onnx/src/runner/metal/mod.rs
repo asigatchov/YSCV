@@ -5,11 +5,13 @@
 
 mod compile;
 mod dispatch;
+pub mod graph;
 mod record;
 mod run;
 mod types;
 
 // Re-export everything so callers don't change
 pub use compile::compile_metal_plan;
+pub use graph::{MpsGraphPlan, compile_mpsgraph_plan, run_mpsgraph_plan};
 pub use run::run_metal_plan;
 pub use types::MetalPlan;

@@ -30,7 +30,7 @@ yscv (umbrella re-export)
 | Total Rust LOC | **140,260** |
 | .rs files | **397** |
 | Tests | **1,678** |
-| SIMD functions | **295** (NEON + SSE + AVX) |
+| SIMD functions | **298** (NEON + SSE + AVX) |
 | GPU WGSL shaders | **17** |
 | Benchmark operations | **100+** |
 
@@ -55,11 +55,11 @@ All dispatch functions have `#[inline]` for cross-crate inlining.
 
 Across 100+ benchmarked operations against NumPy 2.0, PyTorch 2.8, OpenCV 4.13, onnxruntime 1.19, and Apple CoreML (Apple Silicon M3 Pro, March 2026):
 
-- **77 wins** — faster than all competitors
+- **78 wins** — faster than all competitors
 - **~4 parity** — within 10%
 - **0 losses**
 
-Key wins: sigmoid **6.0×** vs PyTorch, relu **6.2×** vs NumPy, resize nearest **3.3×** vs OpenCV, resize bilinear **3.0×** vs OpenCV, sobel u8 **2.3×** vs OpenCV, softmax **2.2×** vs PyTorch, ONNX CPU **3×** vs onnxruntime, Metal GPU **14% faster** than CoreML (11.8ms vs 13.4ms — CoreML uses dedicated Neural Engine hardware). YOLO11n: only runtime that runs it (CPU + GPU), competitors all fail.
+Key wins: sigmoid **6.0×** vs PyTorch, relu **6.2×** vs NumPy, resize nearest **3.3×** vs OpenCV, resize bilinear **3.0×** vs OpenCV, sobel u8 **2.3×** vs OpenCV, softmax **2.2×** vs PyTorch, ONNX CPU **3×** vs onnxruntime, Metal GPU **14% faster** than CoreML (11.8ms vs 13.4ms — CoreML uses dedicated Neural Engine hardware), VballNetGrid **8% faster** than onnxruntime CPU (163ms vs 177ms). YOLO11n: only runtime that runs it (CPU + GPU), competitors all fail.
 
 ## Framework features
 

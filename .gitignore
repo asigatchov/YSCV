@@ -40,6 +40,7 @@ criterion/
 # Models (large binary files)
 *.onnx
 examples/src/slowwork/
+onnx2convert/
 
 # Profiler output
 onnxruntime_profile__*.json

@@ -9,6 +9,19 @@ pub(super) fn exec_conv(
     activation: yscv_kernels::Activation,
 ) -> Result<(), OnnxError> {
     let input_is_nhwc = env.is_nhwc(&node.inputs[0]);
+
+    // BNNS NCHW fast path: when input is already NCHW, use Apple Accelerate
+    // directly without any layout conversion. Opt-in via YSCV_BNNS=1.
+    #[cfg(all(target_os = "macos", feature = "blas"))]
+    if !input_is_nhwc
+        && std::env::var("YSCV_BNNS").is_ok()
+        && let Some(result) = exec_conv_bnns_nchw(node, env, activation)?
+    {
+        env.insert(node.outputs[0].clone(), result);
+        // Do NOT mark_nhwc — output stays NCHW
+        return Ok(());
+    }
+
     let input = get_tensor(env, &node.name, &node.inputs[0])?;
     let weight = get_tensor(env, &node.name, &node.inputs[1])?;
     let bias = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
@@ -33,9 +46,13 @@ pub(super) fn exec_conv(
         &input_nhwc_owned
     };
 
-    // Weight: ONNX [O, I/group, KH, KW] -> yscv [KH, KW, I/group, O]
+    // Weight: ONNX [O, I/group, KH, KW]; pre-permuted group=1 is [KH, KW, I, O].
     let w_shape = weight.shape();
-    let (o_ch, i_per_g, kh, kw) = (w_shape[0], w_shape[1], w_shape[2], w_shape[3]);
+    let (o_ch, i_per_g, kh, kw) = if env.is_khwc_weight(&node.inputs[1]) {
+        (w_shape[3], w_shape[2], w_shape[0], w_shape[1])
+    } else {
+        (w_shape[0], w_shape[1], w_shape[2], w_shape[3])
+    };
 
     let has_padding = pads.iter().any(|&p| p > 0);
     let (pt, pl, pb, pr) = (
@@ -460,4 +477,91 @@ pub(super) fn pad_nhwc_val(
     Tensor::from_vec(vec![n, oh, ow, c], out).map_err(|e| OnnxError::DecodeFailed {
         message: e.to_string(),
     })
+}
+
+// ── BNNS NCHW fast path ────────────────────────────────────────────
+
+/// Try to execute conv via Apple BNNS on NCHW data.
+/// Returns `Ok(Some(tensor))` on success, `Ok(None)` if BNNS can't handle this op.
+#[cfg(all(target_os = "macos", feature = "blas"))]
+fn exec_conv_bnns_nchw(
+    node: &OnnxNode,
+    env: &mut TensorEnv,
+    activation: yscv_kernels::Activation,
+) -> Result<Option<Tensor>, OnnxError> {
+    use yscv_kernels::bnns_conv::{BnnsActivation, BnnsConvParams, conv2d_nchw_bnns};
+
+    let input = get_tensor(env, &node.name, &node.inputs[0])?;
+    let weight = get_tensor(env, &node.name, &node.inputs[1])?;
+    let bias = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
+        Some(get_tensor(env, &node.name, &node.inputs[2])?)
+    } else {
+        None
+    };
+
+    let strides = get_attr_ints(node, "strides").unwrap_or_else(|| vec![1, 1]);
+    let pads = get_attr_ints(node, "pads").unwrap_or_else(|| vec![0, 0, 0, 0]);
+    let group = get_attr_int(node, "group").unwrap_or(1) as usize;
+    let sh = strides[0] as usize;
+    let sw = strides[1] as usize;
+    let (pt, pl, pb, pr) = (
+        pads[0] as usize,
+        pads[1] as usize,
+        pads[2] as usize,
+        pads[3] as usize,
+    );
+
+    // Weight must be OIHW for BNNS. group=1 weights are pre-permuted to KHWC —
+    // reverse them back. Depthwise/grouped weights are already OIHW.
+    let w_oihw_owned;
+    let w_oihw: &Tensor = if env.is_khwc_weight(&node.inputs[1]) {
+        // KHWC [KH, KW, I, O] → OIHW [O, I, KH, KW]
+        w_oihw_owned = weight
+            .permute(&[3, 2, 0, 1])
+            .map_err(|e| OnnxError::DecodeFailed {
+                message: e.to_string(),
+            })?;
+        &w_oihw_owned
+    } else {
+        weight
+    };
+
+    let in_shape = input.shape();
+    if in_shape.len() != 4 {
+        return Ok(None);
+    }
+    let (batch, in_c, in_h, in_w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
+
+    let w_shape = w_oihw.shape();
+    let (out_c, _ic_per_g, kh, kw) = (w_shape[0], w_shape[1], w_shape[2], w_shape[3]);
+
+    let out_h = (in_h + pt + pb - kh) / sh + 1;
+    let out_w = (in_w + pl + pr - kw) / sw + 1;
+
+    let bnns_act = match activation {
+        yscv_kernels::Activation::Silu => BnnsActivation::Silu,
+        yscv_kernels::Activation::None => BnnsActivation::None,
+    };
+
+    let params = BnnsConvParams {
+        batch,
+        in_c,
+        in_h,
+        in_w,
+        out_c,
+        out_h,
+        out_w,
+        kh,
+        kw,
+        stride_h: sh,
+        stride_w: sw,
+        pad_top: pt,
+        pad_left: pl,
+        pad_bottom: pb,
+        pad_right: pr,
+        groups: group,
+        activation: bnns_act,
+    };
+
+    Ok(conv2d_nchw_bnns(input, w_oihw, bias, &params))
 }

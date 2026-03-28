@@ -318,9 +318,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo run --release --features gpu
 ```
 
-### Option B: Metal-native (macOS only — fastest)
+### Option B: Metal MPSGraph (macOS only — fastest)
 
-The Metal-native backend compiles the entire ONNX graph into a single fused command buffer with f16 inter-op buffers. This is the fastest path on Apple Silicon.
+MPSGraph compiles the entire ONNX model into a single GPU dispatch. This is the fastest path on Apple Silicon.
 
 ```toml
 # Cargo.toml
@@ -329,30 +329,23 @@ yscv-kernels = { version = "0.1", features = ["metal-backend"] }
 ```
 
 ```rust
-use yscv_kernels::MetalInference;
-use yscv_onnx::{load_onnx_model_from_file, plan_gpu_execution,
-                 GpuWeightCache, compile_gpu_plan_f16,
-                 run_compiled_gpu_f16_fused};
+use yscv_onnx::{
+    compile_mpsgraph_plan, run_mpsgraph_plan,
+    load_onnx_model_from_file,
+};
 use yscv_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = load_onnx_model_from_file("model.onnx")?;
-    let gpu = MetalInference::new()?;
-    let plan = plan_gpu_execution(&model);
-    let mut wc = GpuWeightCache::new();
-
+    let input_name = model.inputs[0].clone();
     let input = Tensor::from_vec(vec![1, 3, 640, 640], vec![0.5f32; 1*3*640*640])?;
 
-    // Compile the plan (one-time cost)
-    let compiled = compile_gpu_plan_f16(&gpu, &model, &plan, &mut wc, "images", &input)?;
-    println!("Compiled ops: {}", compiled.ops_count());
+    // Compile the graph (one-time cost, ~10-30ms)
+    let plan = compile_mpsgraph_plan(&model, &input_name, &input)?;
 
-    // Run (fused single command buffer)
-    let input_data = input.data();
-    let start = std::time::Instant::now();
-    let outputs = run_compiled_gpu_f16_fused(&gpu, &compiled, input_data)?;
-    println!("Metal inference: {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
-
+    // Run — input as raw f32 slice
+    let input_data = vec![0.5f32; 1 * 3 * 640 * 640];
+    let outputs = run_mpsgraph_plan(&plan, &input_data)?;
     for (name, t) in &outputs {
         println!("{}: {:?}", name, t.shape());
     }
@@ -364,7 +357,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo run --release --features metal-backend
 ```
 
-Metal performance: **11.8ms** on YOLOv8n — 14% faster than CoreML (13.4ms), which delegates to Apple's Neural Engine hardware accelerator. yscv is the only runtime that runs YOLO11n on GPU (12.4ms).
+### Option C: Metal per-op (fallback for unsupported models)
+
+If MPSGraph doesn't support all ops in your model, use the per-op Metal backend:
+
+```rust
+use yscv_onnx::{compile_metal_plan, run_metal_plan, load_onnx_model_from_file};
+use yscv_tensor::Tensor;
+
+let model = load_onnx_model_from_file("model.onnx")?;
+let input = Tensor::from_vec(vec![1, 3, 640, 640], vec![0.5f32; 1*3*640*640])?;
+
+let plan = compile_metal_plan(&model, "images", &input)?;
+let outputs = run_metal_plan(&plan, &vec![0.5f32; 1*3*640*640])?;
+```
+
+Metal performance: **5.9ms** on YOLOv8n (MPSGraph) — 2.3x faster than CoreML (13.4ms). Per-op Metal runs YOLO11n at 21.5ms where CoreML fails entirely.
 
 ---
 
