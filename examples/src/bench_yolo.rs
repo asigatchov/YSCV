@@ -9,7 +9,7 @@ fn main() {
         "examples/src/slowwork/yolo11n.onnx",
     ];
 
-    let input_data = vec![0.5f32; 1 * 3 * 640 * 640];
+    let input_data = vec![0.5f32; 3 * 640 * 640];
     let input_tensor = Tensor::from_vec(vec![1, 3, 640, 640], input_data).unwrap();
 
     for model_path in &models {
