@@ -57,11 +57,23 @@ fn main() {
     println!("  Size: {orig_w}x{orig_h}");
 
     let config = yolov8_coco_config();
-    let (input_tensor, _scale, _pad_x, _pad_y) = letterbox_preprocess(&img, config.input_size);
-    println!(
-        "  Preprocessed to {}x{}",
-        config.input_size, config.input_size
-    );
+    let (letterboxed, _scale, _pad_x, _pad_y) = letterbox_preprocess(&img, config.input_size);
+    let sz = config.input_size;
+    println!("  Preprocessed to {sz}x{sz}");
+
+    // Convert HWC [H, W, 3] → NCHW [1, 3, H, W] for ONNX inference
+    let hwc_data = letterboxed.data();
+    let mut nchw = vec![0.0f32; 3 * sz * sz];
+    for y in 0..sz {
+        for x in 0..sz {
+            let src = (y * sz + x) * 3;
+            for c in 0..3 {
+                nchw[c * sz * sz + y * sz + x] = hwc_data[src + c];
+            }
+        }
+    }
+    let input_tensor =
+        yscv_tensor::Tensor::from_vec(vec![1, 3, sz, sz], nchw).expect("Failed to create tensor");
 
     // Step 3: Run inference
     println!("Running inference...");

@@ -385,7 +385,6 @@ pub fn run_onnx_model(
         if skip.contains(&i) {
             continue;
         }
-
         // --- Conv → BatchNorm → Relu 3-node fusion ---
         if node.op_type == "Conv"
             && let Some(next) = nodes.get(i + 1)
