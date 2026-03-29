@@ -119,19 +119,19 @@ cargo run --release --example bench_yolo
 
 | Backend | Min | Speedup vs CPU |
 |---------|-----|---------------|
-| CPU | 32.7ms | — |
-| Metal per-op | 22.1ms | 1.5x |
-| **MPSGraph** | **4.8ms** | **6.8x** |
-| onnxruntime CPU | 103.4ms | 0.32x |
-| onnxruntime CoreML | 16.1ms | 2.0x |
+| CPU | 31.7ms | — |
+| Metal per-op | 12.1ms | 2.6x |
+| **MPSGraph** | **3.5ms** | **9.1x** |
+| onnxruntime CPU | 100.8ms | 0.31x |
+| onnxruntime CoreML | 14.2ms | 2.2x |
 
 ### YOLO11n (6.5 GFLOP, 640x640 input)
 
 | Backend | Min | Speedup vs CPU |
 |---------|-----|---------------|
-| CPU | 36.4ms | — |
-| Metal per-op | 22.6ms | 1.6x |
-| **MPSGraph** | **5.9ms** | **6.2x** |
+| CPU | 34.3ms | — |
+| Metal per-op | 12.6ms | 2.7x |
+| **MPSGraph** | **5.0ms** | **6.9x** |
 | onnxruntime | FAIL | Opset 22 unsupported |
 
 ### VballNetGrid (16.3 GFLOP, 432x768 input)

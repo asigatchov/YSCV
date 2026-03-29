@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **yscv-onnx**: CPU depthwise and grouped Conv paths now correctly apply fused SiLU activation. Previously, Conv+SiLU fusion only applied the activation in the group=1 path, silently skipping it for depthwise (group=C) and grouped convolutions. This caused YOLO11n (which uses DWConv 3×3 in the detection head) to produce ~34 false detections instead of ~9. YOLOv8n was unaffected (group=1 only).
+
+### Added
+- **examples**: `bench_yolo` now supports `BENCH_COOLDOWN` env var (default 20s) to insert thermal cooldown pauses between benchmarks, preventing CPU frequency throttling on sustained runs.
+
 ## [0.2.0] — 2026-03-18
 
 ### Added

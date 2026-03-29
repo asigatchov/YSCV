@@ -612,6 +612,34 @@ pub fn run_onnx_model(
         execute_node_with_layout(node, &mut env)?;
     }
 
+    // Optional per-op trace for debugging inference divergence.
+    if std::env::var("CPU_TRACE").is_ok() {
+        for node in nodes {
+            for out_name in &node.outputs {
+                if let Some(t) = env.get(out_name) {
+                    let d = t.data();
+                    if d.is_empty() {
+                        continue;
+                    }
+                    let max = d.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let min = d.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                    let mean = d.iter().sum::<f32>() / d.len() as f32;
+                    let nhwc = if env.is_nhwc(out_name) { " [NHWC]" } else { "" };
+                    eprintln!(
+                        "[{:>20}] {:60} shape={:?} min={:>10.4} max={:>10.4} mean={:>10.4}{}",
+                        node.op_type,
+                        out_name,
+                        t.shape(),
+                        min,
+                        max,
+                        mean,
+                        nhwc,
+                    );
+                }
+            }
+        }
+    }
+
     // Ensure all outputs are in NCHW (ONNX standard layout)
     for name in &model.outputs {
         ensure_nchw(&mut env, name)?;

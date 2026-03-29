@@ -1,7 +1,21 @@
 //! Quick benchmark: measure YOLO ONNX inference time (CPU vs GPU).
+//!
+//! Set BENCH_COOLDOWN=<secs> to insert a cooldown pause between benchmarks
+//! (default: 20s). This prevents CPU thermal throttling from skewing results.
 
 use yscv_onnx::load_onnx_model_from_file;
 use yscv_tensor::Tensor;
+
+fn cooldown(label: &str) {
+    let secs: u64 = std::env::var("BENCH_COOLDOWN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    if secs > 0 {
+        println!("\n  --- cooldown {secs}s before {label} ---");
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
+}
 
 fn main() {
     let models = [
@@ -12,7 +26,10 @@ fn main() {
     let input_data = vec![0.5f32; 3 * 640 * 640];
     let input_tensor = Tensor::from_vec(vec![1, 3, 640, 640], input_data).unwrap();
 
-    for model_path in &models {
+    for (model_idx, model_path) in models.iter().enumerate() {
+        if model_idx > 0 {
+            cooldown("next model");
+        }
         println!("\n{} {} {}", "=".repeat(20), model_path, "=".repeat(20));
 
         let model = match load_onnx_model_from_file(model_path) {
@@ -46,6 +63,7 @@ fn main() {
         // ── GPU profile ──────────────────────────────────────────
         #[cfg(feature = "gpu")]
         {
+            cooldown("GPU profile");
             let mut inp = std::collections::HashMap::new();
             inp.insert("images".to_string(), input_tensor.clone());
             let _ = yscv_onnx::profile_onnx_model_gpu(&model, inp);
@@ -54,6 +72,7 @@ fn main() {
         // ── GPU benchmark ──────────────────────────────────────────
         #[cfg(feature = "gpu")]
         {
+            cooldown("GPU benchmark");
             println!("\n  [GPU]");
             let gpu = yscv_kernels::GpuBackend::new().expect("GPU init");
             println!("    Adapter: {}", gpu.adapter_name());
@@ -113,6 +132,7 @@ fn main() {
 
             // ── Compiled plan benchmark ──
             {
+                cooldown("GPU Compiled");
                 println!("\n  [GPU Compiled]");
                 let compiled = yscv_onnx::compile_gpu_plan(
                     &gpu,
@@ -193,6 +213,7 @@ fn main() {
 
             // ── Fused single-pass benchmark (Metal-only) ──
             {
+                cooldown("GPU Fused");
                 println!("\n  [GPU Fused Single-Pass]");
                 let compiled = yscv_onnx::compile_gpu_plan(
                     &gpu,
@@ -291,6 +312,7 @@ fn main() {
 
             // ── f16 I/O fused benchmark ──
             if gpu.has_f16_io() {
+                cooldown("GPU f16");
                 println!("\n  [GPU f16 I/O Fused]");
                 let compiled = yscv_onnx::compile_gpu_plan_f16(
                     &gpu,

@@ -611,24 +611,25 @@ pub fn run_metal_plan(
                                     *c,
                                 );
                             }
-                        } else if let Some((nn, c, h, w)) = nchw_to_nhwc {
+                        } else if let Some((nn, cc, hh, ww)) = nchw_to_nhwc {
+                            // Tuple is (N, C, H, W) but encoder expects (n, h, w, c)
                             if *f16 {
                                 enc.permute_nchw_to_nhwc_f16(
                                     get_buf(input),
                                     get_buf(out),
                                     *nn,
-                                    *c,
-                                    *h,
-                                    *w,
+                                    *hh,
+                                    *ww,
+                                    *cc,
                                 );
                             } else {
                                 enc.permute_nchw_to_nhwc(
                                     get_buf(input),
                                     get_buf(out),
                                     *nn,
-                                    *c,
-                                    *h,
-                                    *w,
+                                    *hh,
+                                    *ww,
+                                    *cc,
                                 );
                             }
                         } else {
@@ -1452,8 +1453,112 @@ pub fn run_metal_plan(
             );
         }
 
+        // Debug: compare all Metal buffers against CPU reference (works for both MPS and non-MPS paths)
+        if !plan.cpu_ref.is_empty() && std::env::var("METAL_COMPARE").is_ok() {
+            #[inline]
+            fn f16_to_f32(bits: u16) -> f32 {
+                let sign = ((bits >> 15) & 1) as u32;
+                let exp = ((bits >> 10) & 0x1F) as u32;
+                let mant = (bits & 0x3FF) as u32;
+                if exp == 0 {
+                    if mant == 0 {
+                        return if sign == 1 { -0.0 } else { 0.0 };
+                    }
+                    let mut m = mant;
+                    let mut e = 1u32;
+                    while m & 0x400 == 0 {
+                        m <<= 1;
+                        e += 1;
+                    }
+                    f32::from_bits((sign << 31) | ((127 - 15 + 1 - e) << 23) | ((m & 0x3FF) << 13))
+                } else if exp == 31 {
+                    if mant == 0 {
+                        return if sign == 1 {
+                            f32::NEG_INFINITY
+                        } else {
+                            f32::INFINITY
+                        };
+                    }
+                    f32::NAN
+                } else {
+                    f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13))
+                }
+            }
+            let mut errors: Vec<(String, f32, f32, usize)> = Vec::new();
+            for (name, cpu_vals) in &plan.cpu_ref {
+                if let Some(buf) = plan.bufs.get(name) {
+                    let n = cpu_vals.len();
+                    let is_f32 = plan.buf_f32.contains(name);
+                    let min_bytes = if is_f32 { n * 4 } else { n * 2 };
+                    if buf.length() as usize >= min_bytes {
+                        let mut max_diff = 0.0f32;
+                        if is_f32 {
+                            let ptr = buf.contents() as *const f32;
+                            let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
+                            for i in 0..n {
+                                let d = (slice[i] - cpu_vals[i]).abs();
+                                if !d.is_nan() && d > max_diff {
+                                    max_diff = d;
+                                }
+                            }
+                        } else {
+                            let ptr = buf.contents() as *const u16;
+                            let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
+                            for i in 0..n {
+                                let d = (f16_to_f32(slice[i]) - cpu_vals[i]).abs();
+                                if !d.is_nan() && d > max_diff {
+                                    max_diff = d;
+                                }
+                            }
+                        }
+                        if max_diff > 0.5 {
+                            let nans = if is_f32 {
+                                let ptr = buf.contents() as *const f32;
+                                let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
+                                (0..n).filter(|&i| slice[i].is_nan()).count()
+                            } else {
+                                let ptr = buf.contents() as *const u16;
+                                let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
+                                (0..n).filter(|&i| f16_to_f32(slice[i]).is_nan()).count()
+                            };
+                            errors.push((name.clone(), max_diff, nans as f32, n));
+                        }
+                    }
+                }
+            }
+            errors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("  [COMPARE] {} buffers with max_diff > 0.5:", errors.len());
+            for (name, max_diff, nans, n) in errors.iter().take(40) {
+                let shape = plan
+                    .buf_shapes
+                    .get(name)
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_default();
+                let nhwc_flag = plan.buf_nhwc.get(name).copied().unwrap_or(false);
+                let is_f32 = plan.buf_f32.contains(name);
+                let buf = plan.bufs.get(name).unwrap();
+                let cpu_v = &plan.cpu_ref[name];
+                let show = 6.min(*n);
+                let mtl: Vec<f32> = if is_f32 {
+                    let ptr = buf.contents() as *const f32;
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, *n) };
+                    (0..show).map(|i| slice[i]).collect()
+                } else {
+                    let ptr = buf.contents() as *const u16;
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, *n) };
+                    (0..show).map(|i| f16_to_f32(slice[i])).collect()
+                };
+                let cpu: Vec<f32> = cpu_v[..show].to_vec();
+                eprintln!(
+                    "    '{}' {} nhwc={} f32={} max_diff={:.2} nans={} mtl={:.3?} cpu={:.3?}",
+                    name, shape, nhwc_flag, is_f32, max_diff, *nans as usize, mtl, cpu
+                );
+            }
+        }
+
         // Download outputs inside autoreleasepool (read from _f32out buffers cast from f16)
         let mut result = HashMap::new();
+        let debug_dl = std::env::var("METAL_DEBUG_DL").is_ok();
         for name in &plan.output_names {
             let f32out_name = format!("{}_f32out", name);
             let read_name = if plan.bufs.contains_key(&f32out_name) {
@@ -1464,6 +1569,47 @@ pub fn run_metal_plan(
             if let (Some(buf), Some(shape)) = (plan.bufs.get(read_name), plan.buf_shapes.get(name))
             {
                 let n: usize = shape.iter().product();
+                if debug_dl {
+                    eprintln!(
+                        "  [DL] output '{}' read_from='{}' buf_len={} n_elem={} shape={:?}",
+                        name,
+                        read_name,
+                        buf.length(),
+                        n,
+                        shape
+                    );
+                    // Also check the raw f16 buffer
+                    if let Some(f16_buf) = plan.bufs.get(name) {
+                        let f16_ptr = f16_buf.contents() as *const u16;
+                        let show = 8.min(n);
+                        let raw_f16: Vec<u16> =
+                            unsafe { std::slice::from_raw_parts(f16_ptr, show).to_vec() };
+                        let f16_as_f32: Vec<f32> = raw_f16
+                            .iter()
+                            .map(|&bits| {
+                                let sign = ((bits >> 15) & 1) as u32;
+                                let exp = ((bits >> 10) & 0x1F) as u32;
+                                let mant = (bits & 0x3FF) as u32;
+                                if exp == 0 {
+                                    0.0
+                                } else if exp == 31 {
+                                    if mant == 0 { f32::INFINITY } else { f32::NAN }
+                                } else {
+                                    let e = exp as i32 - 15 + 127;
+                                    let f = (sign << 31) | ((e as u32) << 23) | (mant << 13);
+                                    f32::from_bits(f)
+                                }
+                            })
+                            .collect();
+                        eprintln!(
+                            "  [DL] f16 buf '{}' len={} raw_bits={:04X?} as_f32={:.4?}",
+                            name,
+                            f16_buf.length(),
+                            &raw_f16[..show],
+                            &f16_as_f32[..show]
+                        );
+                    }
+                }
                 let data = plan.inf.read_buffer_f32(buf, n);
                 let is_nhwc = *plan.buf_nhwc.get(name).unwrap_or(&false);
 

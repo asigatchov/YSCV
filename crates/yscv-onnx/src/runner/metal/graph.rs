@@ -742,7 +742,16 @@ fn build_graph_node(
             let axis = get_attr_int(node, "axis").unwrap_or(-1);
             let ndim = in_shape.len() as i64;
             let ax = if axis < 0 { ndim + axis } else { axis };
-            let out = graph.softmax(input, ax);
+
+            // Run attention softmax in f32 to avoid f16 exp() underflow/overflow
+            let is_attn = node.name.contains("/attn/");
+            let out = if is_attn {
+                let input_f32 = graph.cast_to_f32(input);
+                let result_f32 = graph.softmax(input_f32, ax);
+                graph.cast_to_f16(result_f32)
+            } else {
+                graph.softmax(input, ax)
+            };
             Some(vec![(node.outputs[0].clone(), out, in_shape)])
         }
 
@@ -797,7 +806,17 @@ fn build_graph_node(
             let b = get(&node.inputs[1])?;
             let a_shape = get_shape(&node.inputs[0]);
             let b_shape = get_shape(&node.inputs[1]);
-            let out = graph.matmul(a, b);
+
+            // Run attention MatMul in f32 to avoid f16 accumulation errors
+            let is_attn = node.name.contains("/attn/");
+            let out = if is_attn {
+                let a_f32 = graph.cast_to_f32(a);
+                let b_f32 = graph.cast_to_f32(b);
+                let result_f32 = graph.matmul(a_f32, b_f32);
+                graph.cast_to_f16(result_f32)
+            } else {
+                graph.matmul(a, b)
+            };
 
             // Output shape: [..., M, N] from [..., M, K] x [..., K, N]
             let mut out_shape = a_shape.clone();

@@ -1,5 +1,5 @@
 use ::metal::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use yscv_kernels::metal_backend::metal_conv::{ConvParams, MetalInference, WinogradParams};
 
@@ -30,6 +30,8 @@ pub struct MetalPlan {
     /// Debug: CPU reference data for per-buffer comparison (only when METAL_COMPARE is set)
     #[allow(dead_code)]
     pub(crate) cpu_ref: HashMap<String, Vec<f32>>,
+    /// Buffers that hold f32 data (for attention chain)
+    pub(crate) buf_f32: HashSet<String>,
 }
 
 #[allow(dead_code)]

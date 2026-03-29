@@ -247,30 +247,67 @@ pub fn letterbox_preprocess(image: &Tensor, target_size: usize) -> (Tensor, f32,
     let data = image.data();
 
     let scale = (target_size as f32 / src_w as f32).min(target_size as f32 / src_h as f32);
-    let new_w = (src_w as f32 * scale).round() as usize;
-    let new_h = (src_h as f32 * scale).round() as usize;
+    let new_w = ((src_w as f32 * scale).round() as usize).min(target_size);
+    let new_h = ((src_h as f32 * scale).round() as usize).min(target_size);
     let pad_x = (target_size - new_w) as f32 / 2.0;
     let pad_y = (target_size - new_h) as f32 / 2.0;
     let pad_left = pad_x.floor() as usize;
     let pad_top = pad_y.floor() as usize;
 
-    // Fill with 0.5 grey (common YOLO letterbox fill).
+    // Standard YOLO letterbox fill: 114 in uint8 = 114/255 in float.
     let total = target_size * target_size * 3;
-    let mut out = vec![0.5f32; total];
+    let mut out = vec![114.0f32 / 255.0; total];
 
-    // Nearest-neighbour resize into the padded region.
-    let scale_x = src_w as f32 / new_w as f32;
-    let scale_y = src_h as f32 / new_h as f32;
+    // Resize with anti-aliased bilinear (Pillow-compatible).
+    // For downscaling (scale < 1), use a filter window proportional to 1/scale
+    // so each output pixel averages the correct number of input pixels.
+    // For upscaling (scale >= 1), fall back to standard 2x2 bilinear.
+    let inv_scale_x = src_w as f32 / new_w as f32;
+    let inv_scale_y = src_h as f32 / new_h as f32;
+    // Filter support: bilinear filter has radius 1.0, scaled by inv_scale for downsampling.
+    let support_x = if inv_scale_x > 1.0 { inv_scale_x } else { 1.0 };
+    let support_y = if inv_scale_y > 1.0 { inv_scale_y } else { 1.0 };
 
     for y in 0..new_h {
-        let src_y = ((y as f32 * scale_y) as usize).min(src_h - 1);
+        // Center of this output pixel in source coordinates
+        let center_y = (y as f32 + 0.5) * inv_scale_y - 0.5;
+        let y_min = ((center_y - support_y).ceil() as isize).max(0) as usize;
+        let y_max = ((center_y + support_y).floor() as isize).min(src_h as isize - 1) as usize;
+
         for x in 0..new_w {
-            let src_x = ((x as f32 * scale_x) as usize).min(src_w - 1);
+            let center_x = (x as f32 + 0.5) * inv_scale_x - 0.5;
+            let x_min = ((center_x - support_x).ceil() as isize).max(0) as usize;
+            let x_max = ((center_x + support_x).floor() as isize).min(src_w as isize - 1) as usize;
+
             let dst_idx = ((pad_top + y) * target_size + (pad_left + x)) * 3;
-            let src_idx = (src_y * src_w + src_x) * 3;
-            out[dst_idx] = data[src_idx];
-            out[dst_idx + 1] = data[src_idx + 1];
-            out[dst_idx + 2] = data[src_idx + 2];
+            let mut sum = [0.0f32; 3];
+            let mut weight_sum = 0.0f32;
+
+            for sy in y_min..=y_max {
+                let wy = 1.0 - (sy as f32 - center_y).abs() / support_y;
+                if wy <= 0.0 {
+                    continue;
+                }
+                for sx in x_min..=x_max {
+                    let wx = 1.0 - (sx as f32 - center_x).abs() / support_x;
+                    if wx <= 0.0 {
+                        continue;
+                    }
+                    let w = wx * wy;
+                    let src_idx = (sy * src_w + sx) * 3;
+                    sum[0] += data[src_idx] * w;
+                    sum[1] += data[src_idx + 1] * w;
+                    sum[2] += data[src_idx + 2] * w;
+                    weight_sum += w;
+                }
+            }
+
+            if weight_sum > 0.0 {
+                let inv_w = 1.0 / weight_sum;
+                out[dst_idx] = sum[0] * inv_w;
+                out[dst_idx + 1] = sum[1] * inv_w;
+                out[dst_idx + 2] = sum[2] * inv_w;
+            }
         }
     }
 
@@ -555,7 +592,10 @@ mod tests {
         // Check that the padded (grey 0.5) region exists at top.
         let top_pixel = &out.data()[0..3];
         for &v in top_pixel {
-            assert!((v - 0.5).abs() < 1e-6, "top padding should be 0.5 grey");
+            assert!(
+                (v - 114.0 / 255.0).abs() < 1e-6,
+                "top padding should be 114/255 grey"
+            );
         }
     }
 }

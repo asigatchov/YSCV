@@ -99,5 +99,15 @@ name = "bench_metal_vball"
 path = "src/bench_metal_vball.rs"
 required-features = ["metal-backend"]
 
+[[example]]
+name = "debug_metal_yolo"
+path = "src/debug_metal_yolo.rs"
+required-features = ["metal-backend"]
+
+[[example]]
+name = "yolo_vis"
+path = "src/yolo_vis.rs"
+required-features = ["metal-backend"]
+
 [lints]
 workspace = true

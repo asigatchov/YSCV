@@ -67,6 +67,8 @@ pub fn compile_metal_plan(
     let mut buf_shapes: HashMap<String, Vec<usize>> = HashMap::new();
     let mut buf_nhwc: HashMap<String, bool> = HashMap::new();
     let mut ops = Vec::new();
+    // Track buffers that are in f32 format (for attention precision chain)
+    let mut f32_bufs: HashSet<String> = HashSet::new();
 
     // Upload input: for 4D NCHW, do f32→f16 + NCHW→NHWC on CPU (avoids GPU cast op).
     let input_shape = input_tensor.shape();
@@ -486,25 +488,36 @@ pub fn compile_metal_plan(
             &mut buf_shapes,
             &mut buf_nhwc,
             &mut ops,
+            &mut f32_bufs,
         )?;
     }
 
     let output_names = model.outputs.clone();
 
     // Add CastF16ToF32 for each output so the host can read f32
+    // (skip if the output is already f32 from the attention chain)
     for out_name in &output_names {
         if let Some(shape) = buf_shapes.get(out_name) {
             let n: usize = shape.iter().product();
             if n > 0 {
-                let f32_name = format!("{}_f32out", out_name);
-                bufs.insert(f32_name.clone(), inf.output_buffer(n));
-                buf_shapes.insert(f32_name.clone(), shape.clone());
-                buf_nhwc.insert(f32_name.clone(), *buf_nhwc.get(out_name).unwrap_or(&false));
-                ops.push(MetalOp::CastF16ToF32 {
-                    input: out_name.clone(),
-                    out: f32_name,
-                    n: n as u32,
-                });
+                if f32_bufs.contains(out_name) {
+                    // Output is already f32 — just alias to the f32out name
+                    let f32_name = format!("{}_f32out", out_name);
+                    let existing = bufs.get(out_name).unwrap().clone();
+                    bufs.insert(f32_name.clone(), existing);
+                    buf_shapes.insert(f32_name.clone(), shape.clone());
+                    buf_nhwc.insert(f32_name.clone(), *buf_nhwc.get(out_name).unwrap_or(&false));
+                } else {
+                    let f32_name = format!("{}_f32out", out_name);
+                    bufs.insert(f32_name.clone(), inf.output_buffer(n));
+                    buf_shapes.insert(f32_name.clone(), shape.clone());
+                    buf_nhwc.insert(f32_name.clone(), *buf_nhwc.get(out_name).unwrap_or(&false));
+                    ops.push(MetalOp::CastF16ToF32 {
+                        input: out_name.clone(),
+                        out: f32_name,
+                        n: n as u32,
+                    });
+                }
             }
         }
     }
@@ -514,7 +527,7 @@ pub fn compile_metal_plan(
     // with no other consumers, we set out_stride/out_offset on each conv so
     // it writes interleaved into the pre-allocated concat buffer, eliminating
     // the concat copy entirely.
-    {
+    if std::env::var("METAL_NO_CONV_CONCAT").is_err() {
         // Map conv output name → op index (only for kernels with strided output support)
         let mut conv_out_idx: HashMap<&str, usize> = HashMap::new();
         for (i, op) in ops.iter().enumerate() {
@@ -679,7 +692,7 @@ pub fn compile_metal_plan(
 
     // ── Detection head fusion: CpuReshape(NHWC→NCHW) + FlatConcat → NhwcToFlatConcat ──
     // Replaces separate NHWC→NCHW permutations + flat copy with a single fused kernel.
-    {
+    if std::env::var("METAL_NO_FUSION").is_err() {
         // Map CpuReshape output name → (op_idx, nhwc_input_name, (n,h,w,c))
         let mut reshape_info: HashMap<&str, (usize, &str, (u32, u32, u32, u32))> = HashMap::new();
         for (i, op) in ops.iter().enumerate() {
@@ -841,7 +854,7 @@ pub fn compile_metal_plan(
     // In-place optimization: for elementwise ops where an input buffer
     // is dead after this op, alias the output buffer to that input.
     // This saves both a buffer allocation and a full read+write round-trip.
-    {
+    if std::env::var("METAL_NO_INPLACE").is_err() {
         // Compute last_use: buffer_name → last op index that reads it
         let mut last_use: HashMap<String, usize> = HashMap::new();
         for (i, op) in ops.iter().enumerate() {
@@ -959,6 +972,7 @@ pub fn compile_metal_plan(
         input_upload,
         output_names,
         cpu_ref,
+        buf_f32: f32_bufs,
     })
 }
 
@@ -985,6 +999,14 @@ pub(crate) fn ensure_on_metal(
 
 // ── Ensure NHWC layout ──
 
+/// Ensure tensor `name` is available in NHWC layout for Conv/Pool/Resize.
+/// Returns the buffer name that contains NHWC data — callers must use this
+/// name (not the original) for the op's input field.
+///
+/// If already NHWC, returns `name` unchanged.  Otherwise records a
+/// NCHW→NHWC permutation into a *separate* buffer (`{name}_nhwc_perm`)
+/// and returns that name.  The original `bufs[name]` is never aliased,
+/// so earlier ops that write NCHW data to it are unaffected.
 pub(crate) fn ensure_nhwc_metal(
     inf: &MetalInference,
     name: &str,
@@ -992,40 +1014,49 @@ pub(crate) fn ensure_nhwc_metal(
     shapes: &mut HashMap<String, Vec<usize>>,
     nhwc: &mut HashMap<String, bool>,
     ops: &mut Vec<MetalOp>,
-) {
+) -> String {
+    // Already NHWC natively (e.g. output of a previous Conv)
     if *nhwc.get(name).unwrap_or(&false) {
-        return;
+        return name.to_string();
     }
+
+    // Already permuted by a previous ensure_nhwc_metal call (skip connection)
+    let nhwc_name = format!("{}_nhwc_perm", name);
+    if bufs.contains_key(&nhwc_name) {
+        return nhwc_name;
+    }
+
     let shape = match shapes.get(name) {
         Some(s) if s.len() == 4 => s.clone(),
-        _ => return,
+        _ => return name.to_string(),
     };
     let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
     let total = n * c * h * w;
-    if bufs.contains_key(name) {
-        if std::env::var("METAL_PERM_DBG").is_ok() {
-            eprintln!("  NHWC perm: '{}' shape={:?}", name, shape);
-        }
-        // GPU-side NCHW→NHWC via Metal kernel (runs every inference).
-        // Previous CPU-side approach was incorrect: it permuted uninitialized
-        // compilation-time buffers; runtime data written by CastF32ToF16 or
-        // preceding ops would overwrite them with NCHW layout.
-        let nhwc_name = format!("{}_nhwc_perm", name);
-        bufs.insert(nhwc_name.clone(), inf.output_buffer_f16(total));
-        ops.push(MetalOp::CpuReshape {
-            input: name.to_string(),
-            out: nhwc_name.clone(),
-            n: total as u32,
-            nhwc_to_nchw: None,
-            nchw_to_nhwc: Some((n as u32, c as u32, h as u32, w as u32)),
-            f16: true,
-        });
-        // Alias original name to NHWC buffer so downstream ops read NHWC
-        let nhwc_buf = bufs.get(&nhwc_name).unwrap().clone();
-        bufs.insert(name.to_string(), nhwc_buf);
-        shapes.insert(name.to_string(), vec![n, h, w, c]);
-        nhwc.insert(name.to_string(), true);
+    if !bufs.contains_key(name) {
+        return name.to_string();
     }
+
+    if std::env::var("METAL_PERM_DBG").is_ok() {
+        eprintln!("  NHWC perm: '{}' shape={:?}", name, shape);
+    }
+
+    // Allocate a separate NHWC output buffer — do NOT alias bufs[name].
+    bufs.insert(nhwc_name.clone(), inf.output_buffer_f16(total));
+    shapes.insert(nhwc_name.clone(), vec![n, h, w, c]);
+
+    // CpuReshape reads from bufs[name] (NCHW) and writes to bufs[nhwc_name] (NHWC).
+    // At runtime both names resolve to distinct GPU buffers, so earlier ops that
+    // write to bufs[name] are unaffected.
+    ops.push(MetalOp::CpuReshape {
+        input: name.to_string(),
+        out: nhwc_name.clone(),
+        n: total as u32,
+        nhwc_to_nchw: None,
+        nchw_to_nhwc: Some((n as u32, c as u32, h as u32, w as u32)),
+        f16: true,
+    });
+
+    nhwc_name
 }
 
 /// Fallback: record a CPU op that will execute at runtime.

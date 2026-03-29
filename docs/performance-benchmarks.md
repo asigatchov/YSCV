@@ -167,8 +167,8 @@ Methodology: 50 timed runs after warmup, min reported. Apple M1 MacBook Air.
 
 | Runtime | YOLOv8n | YOLO11n | Notes |
 |---------|---------|---------|-------|
-| **yscv** | **32.7ms** | **36.4ms** | Pure Rust, NHWC layout, BLAS matmul |
-| onnxruntime 1.19 CPU | 100.3ms | FAILED | Opset 22 unsupported |
+| **yscv** | **31.7ms** | **34.3ms** | Pure Rust, NHWC layout, BLAS matmul |
+| onnxruntime 1.19 CPU | 100.8ms | FAILED | Opset 22 unsupported |
 | tract 0.21 | 217.2ms | FAILED | TDim parse error |
 
 yscv CPU is **3.2× faster** than onnxruntime and **6.6× faster** than tract on YOLOv8n.
@@ -178,11 +178,11 @@ Both competitors fail on YOLO11n (opset 22), while yscv runs it without issues.
 
 | Runtime | YOLOv8n | YOLO11n | Notes |
 |---------|:---:|:---:|-------|
-| **yscv MPSGraph** | **4.8ms** | **5.9ms** | Whole-model graph compilation, single GPU dispatch |
-| yscv Metal per-op | 22.1ms | 22.6ms | Per-op command buffer, Winograd + MPS GEMM |
-| onnxruntime CoreML | 16.1ms | FAILED | Apple Neural Engine delegation |
+| **yscv MPSGraph** | **3.5ms** | **5.0ms** | Whole-model graph compilation, single GPU dispatch |
+| yscv Metal per-op | 12.1ms | 12.6ms | Per-op command buffer, Winograd + MPS GEMM |
+| onnxruntime CoreML | 14.2ms | FAILED | Apple Neural Engine delegation |
 
-**MPSGraph** compiles the entire ONNX model into an `MPSGraphExecutable` and runs it as a single GPU dispatch — eliminating per-op encoder transitions. **3.4× faster than CoreML** on YOLOv8n.
+**MPSGraph** compiles the entire ONNX model into an `MPSGraphExecutable` and runs it as a single GPU dispatch — eliminating per-op encoder transitions. **4× faster than CoreML** on YOLOv8n.
 
 yscv is the only runtime that runs both YOLOv8n and YOLO11n on GPU. CoreML fails on YOLO11n (opset 22).
 
@@ -222,11 +222,11 @@ fused command buffer. Key optimizations (in order of impact):
 
 | Metric | yscv | onnxruntime | tract |
 |--------|------|-------------|-------|
-| YOLOv8n CPU | **WIN** (32.7ms vs 103.4ms, 3.2×) | baseline | 6.7× slower |
-| YOLO11n CPU | **WIN** (36.4ms) | FAIL | FAIL |
+| YOLOv8n CPU | **WIN** (31.7ms vs 100.8ms, 3.2×) | baseline | 6.7× slower |
+| YOLO11n CPU | **WIN** (34.3ms) | FAIL | FAIL |
 | VballNet CPU | **WIN** (124.1ms vs 196.7ms, 1.6×) | baseline | N/A |
-| YOLOv8n GPU (MPSGraph) | **WIN** (4.8ms vs CoreML 16.1ms, 3.4×) | CoreML (ANE hw) | N/A |
-| YOLO11n GPU (MPSGraph) | **WIN** (5.9ms) | FAIL | N/A |
+| YOLOv8n GPU (MPSGraph) | **WIN** (3.5ms vs CoreML 14.2ms, 4.1×) | CoreML (ANE hw) | N/A |
+| YOLO11n GPU (MPSGraph) | **WIN** (5.0ms) | FAIL | N/A |
 | VballNet GPU (MPSGraph) | **WIN** (7.8ms vs CoreML 8.6ms, 1.1×) | CoreML CPU_ONLY (BNNS/AMX) | N/A |
 | Opset 22 support | Yes | No | No |
 

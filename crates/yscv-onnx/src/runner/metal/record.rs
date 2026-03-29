@@ -1,5 +1,5 @@
 use ::metal::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::compile::{cpu_fallback, ensure_nhwc_metal, ensure_on_metal};
 use super::types::*;
@@ -13,6 +13,75 @@ use yscv_kernels::metal_backend::metal_conv::{
 
 use crate::error::OnnxError;
 use crate::loader::OnnxNode;
+
+// ── f32 attention chain helpers ──
+
+/// Resolve an input buffer for the attention f32 chain.
+/// - If `is_attn` and the buffer is f16, insert CastF16ToF32 and return the f32 name.
+/// - If `!is_attn` and the buffer is f32, insert CastF32ToF16 and return the f16 name.
+/// - Otherwise, return the name unchanged.
+fn resolve_attn_input(
+    inf: &MetalInference,
+    name: &str,
+    is_attn: bool,
+    bufs: &mut HashMap<String, Buffer>,
+    shapes: &mut HashMap<String, Vec<usize>>,
+    nhwc_map: &mut HashMap<String, bool>,
+    ops: &mut Vec<MetalOp>,
+    f32_bufs: &mut HashSet<String>,
+) -> String {
+    if name.is_empty() || !bufs.contains_key(name) {
+        return name.to_string();
+    }
+    let is_f32 = f32_bufs.contains(name);
+
+    if is_attn && !is_f32 {
+        // Need f32 version of this f16 buffer
+        let f32_name = format!("{}_attnf32", name);
+        if bufs.contains_key(&f32_name) {
+            return f32_name;
+        }
+        let n: usize = shapes.get(name).map(|s| s.iter().product()).unwrap_or(0);
+        if n > 0 {
+            bufs.insert(f32_name.clone(), inf.output_buffer(n));
+            shapes.insert(
+                f32_name.clone(),
+                shapes.get(name).cloned().unwrap_or_default(),
+            );
+            nhwc_map.insert(f32_name.clone(), *nhwc_map.get(name).unwrap_or(&false));
+            f32_bufs.insert(f32_name.clone());
+            ops.push(MetalOp::CastF16ToF32 {
+                input: name.to_string(),
+                out: f32_name.clone(),
+                n: n as u32,
+            });
+        }
+        f32_name
+    } else if !is_attn && is_f32 {
+        // Need f16 version of this f32 buffer
+        let f16_name = format!("{}_attnf16", name);
+        if bufs.contains_key(&f16_name) {
+            return f16_name;
+        }
+        let n: usize = shapes.get(name).map(|s| s.iter().product()).unwrap_or(0);
+        if n > 0 {
+            bufs.insert(f16_name.clone(), inf.output_buffer_f16(n));
+            shapes.insert(
+                f16_name.clone(),
+                shapes.get(name).cloned().unwrap_or_default(),
+            );
+            nhwc_map.insert(f16_name.clone(), *nhwc_map.get(name).unwrap_or(&false));
+            ops.push(MetalOp::CastF32ToF16 {
+                input: name.to_string(),
+                out: f16_name.clone(),
+                n: n as u32,
+            });
+        }
+        f16_name
+    } else {
+        name.to_string()
+    }
+}
 
 // ── Record conv dispatch ──
 
@@ -51,9 +120,9 @@ pub(crate) fn record_conv(
     // Ensure input is NHWC
     let input_name = &node.inputs[0];
     ensure_on_metal(inf, input_name, env, bufs, shapes, nhwc);
-    ensure_nhwc_metal(inf, input_name, bufs, shapes, nhwc, ops);
+    let nhwc_input = ensure_nhwc_metal(inf, input_name, bufs, shapes, nhwc, ops);
 
-    let in_shape = shapes.get(input_name).cloned().unwrap_or_default();
+    let in_shape = shapes.get(&nhwc_input).cloned().unwrap_or_default();
     if in_shape.len() != 4 {
         return Ok(());
     }
@@ -121,13 +190,19 @@ pub(crate) fn record_conv(
     // dedicated depthwise kernel.
     if group > 1 && group == ic && group == o_ch {
         ops.push(MetalOp::DepthwiseConv {
-            input: input_name.clone(),
+            input: nhwc_input.clone(),
             weight: w_key,
             bias: b_key,
             output: out_name.clone(),
             params,
         });
-    } else if sh == 1 && sw == 1 && kh == 3 && kw == 3 && group == 1 {
+    } else if sh == 1
+        && sw == 1
+        && kh == 3
+        && kw == 3
+        && group == 1
+        && std::env::var("METAL_NO_WINO").is_err()
+    {
         // Winograd FIRST for 3×3 stride=1: 4× FLOP reduction + stays in unified
         // single-encoder path (no encoder transitions). Always preferred over MPS
         // for 3×3 because Winograd's FLOP reduction outweighs MPS GEMM speedup,
@@ -160,7 +235,7 @@ pub(crate) fn record_conv(
                     expected
                 );
                 ops.push(MetalOp::ConvGemm {
-                    input: input_name.clone(),
+                    input: nhwc_input.clone(),
                     weight: w_key,
                     bias: b_key,
                     output: out_name.clone(),
@@ -233,7 +308,7 @@ pub(crate) fn record_conv(
             in_offset: 0,
         };
         ops.push(MetalOp::ConvWinograd {
-            input: input_name.clone(),
+            input: nhwc_input.clone(),
             weight: wino_w_key,
             bias: b_key,
             output: out_name.clone(),
@@ -245,9 +320,10 @@ pub(crate) fn record_conv(
             residual: None,
         });
     } else {
-        // Non-depthwise, non-Winograd conv: prefer MPS GEMM (Apple's tuned kernel).
-        // ConvGemm compute shaders are fallback only when MPS is disabled.
-        let use_mps = std::env::var("METAL_NO_MPS").is_err();
+        // Non-depthwise, non-Winograd conv: ConvGemm compute shaders by default.
+        // MPS GEMM is opt-in via METAL_MPS=1 (has known precision issues with
+        // non-aligned column counts, e.g. K=27 for first 3×3 stride=2 conv).
+        let use_mps = std::env::var("METAL_MPS").is_ok();
         let is_1x1 = kh == 1 && kw == 1 && sh == 1 && sw == 1 && pads[0] == 0 && pads[1] == 0;
         let use_direct = (col_k * o_ch) < 1024;
 
@@ -261,7 +337,7 @@ pub(crate) fn record_conv(
                 Some(im2col_name)
             };
             ops.push(MetalOp::MpsConv {
-                input: input_name.clone(),
+                input: nhwc_input.clone(),
                 weight: w_key,
                 bias: b_key,
                 output: out_name.clone(),
@@ -285,7 +361,7 @@ pub(crate) fn record_conv(
             });
         } else if use_direct {
             ops.push(MetalOp::ConvDirect {
-                input: input_name.clone(),
+                input: nhwc_input.clone(),
                 weight: w_key,
                 bias: b_key,
                 output: out_name.clone(),
@@ -294,7 +370,7 @@ pub(crate) fn record_conv(
             });
         } else {
             ops.push(MetalOp::ConvGemm {
-                input: input_name.clone(),
+                input: nhwc_input.clone(),
                 weight: w_key,
                 bias: b_key,
                 output: out_name.clone(),
@@ -320,6 +396,7 @@ pub(crate) fn record_node(
     shapes: &mut HashMap<String, Vec<usize>>,
     nhwc: &mut HashMap<String, bool>,
     ops: &mut Vec<MetalOp>,
+    f32_bufs: &mut HashSet<String>,
 ) -> Result<(), OnnxError> {
     // Ensure all inputs are available
     for input_name in &node.inputs {
@@ -328,6 +405,11 @@ pub(crate) fn record_node(
         }
         ensure_on_metal(inf, input_name, env, bufs, shapes, nhwc);
     }
+
+    // f32 precision chain: only force f32 for MatMul and Softmax in attention blocks.
+    // Other ops propagate f32 from inputs (Transpose/Reshape) or cast back to f16 (Binary/Unary).
+    let is_attn_matmul = node.name.contains("/attn/") && node.op_type == "MatMul";
+    let is_attn_softmax = node.name.contains("/attn/") && node.op_type == "Softmax";
 
     match node.op_type.as_str() {
         "Conv" => {
@@ -342,21 +424,111 @@ pub(crate) fn record_node(
                 "Div" => 3,
                 _ => 0,
             };
-            let a_name = &node.inputs[0];
-            let b_name = &node.inputs[1];
-            let a_shape = shapes.get(a_name).cloned().unwrap_or_default();
-            let b_shape = shapes.get(b_name).cloned().unwrap_or_default();
-            let a_n: usize = a_shape.iter().product();
-            let b_n: usize = b_shape.iter().product();
+
+            // Check f32 status of raw inputs BEFORE resolving
+            let a_is_f32 = f32_bufs.contains(node.inputs[0].as_str());
+            let b_is_f32 = f32_bufs.contains(node.inputs[1].as_str());
+
+            // Peek at sizes to decide broadcast vs same-size
+            let a_shape_raw = shapes.get(&node.inputs[0]).cloned().unwrap_or_default();
+            let b_shape_raw = shapes.get(&node.inputs[1]).cloned().unwrap_or_default();
+            let a_n_raw: usize = a_shape_raw.iter().product();
+            let b_n_raw: usize = b_shape_raw.iter().product();
+
+            // For broadcast ops where the big tensor is f32 (attention scale multiply),
+            // keep f32. For same-size ops, cast f32→f16.
+            let use_f32 = if a_n_raw != b_n_raw {
+                // Broadcast: keep f32 if the big tensor is f32
+                if a_n_raw > b_n_raw {
+                    a_is_f32
+                } else {
+                    b_is_f32
+                }
+            } else {
+                // Same-size: keep f32 only if BOTH are f32
+                a_is_f32 && b_is_f32
+            };
+
+            let mut actual_a = resolve_attn_input(
+                inf,
+                &node.inputs[0],
+                use_f32,
+                bufs,
+                shapes,
+                nhwc,
+                ops,
+                f32_bufs,
+            );
+            let mut actual_b = resolve_attn_input(
+                inf,
+                &node.inputs[1],
+                use_f32,
+                bufs,
+                shapes,
+                nhwc,
+                ops,
+                f32_bufs,
+            );
+            let mut a_shape = shapes.get(&actual_a).cloned().unwrap_or_default();
+            let mut b_shape = shapes.get(&actual_b).cloned().unwrap_or_default();
+            let mut a_n: usize = a_shape.iter().product();
+            let mut b_n: usize = b_shape.iter().product();
 
             if a_n == 0 || b_n == 0 {
                 // CPU fallback for empty tensors
                 return Ok(());
             }
 
+            // Fix NHWC/NCHW layout mismatch: if one input is NHWC and the other is NCHW
+            // with the same element count, convert the NCHW one to NHWC.
+            let a_nhwc_flag = *nhwc.get(actual_a.as_str()).unwrap_or(&false);
+            let b_nhwc_flag = *nhwc.get(actual_b.as_str()).unwrap_or(&false);
+            if a_n == b_n && a_nhwc_flag != b_nhwc_flag && a_shape.len() == 4 && b_shape.len() == 4
+            {
+                // Convert the NCHW input to NHWC
+                let (nchw_name, nchw_shape, is_nchw_a) = if !a_nhwc_flag {
+                    (actual_a.clone(), a_shape.clone(), true)
+                } else {
+                    (actual_b.clone(), b_shape.clone(), false)
+                };
+                let (nn, cc, hh, ww) = (nchw_shape[0], nchw_shape[1], nchw_shape[2], nchw_shape[3]);
+                let permuted_name = format!("{}_nhwc", nchw_name);
+                let is_src_f32 = f32_bufs.contains(&nchw_name);
+                if is_src_f32 {
+                    bufs.insert(permuted_name.clone(), inf.output_buffer(a_n));
+                    f32_bufs.insert(permuted_name.clone());
+                } else {
+                    bufs.insert(permuted_name.clone(), inf.output_buffer_f16(a_n));
+                }
+                shapes.insert(permuted_name.clone(), vec![nn, hh, ww, cc]);
+                nhwc.insert(permuted_name.clone(), true);
+                ops.push(MetalOp::CpuReshape {
+                    input: nchw_name,
+                    out: permuted_name.clone(),
+                    n: a_n as u32,
+                    nhwc_to_nchw: None,
+                    nchw_to_nhwc: Some((nn as u32, cc as u32, hh as u32, ww as u32)),
+                    f16: !is_src_f32,
+                });
+                if is_nchw_a {
+                    actual_a = permuted_name;
+                    a_shape = shapes.get(&actual_a).cloned().unwrap_or_default();
+                    a_n = a_shape.iter().product();
+                } else {
+                    actual_b = permuted_name;
+                    b_shape = shapes.get(&actual_b).cloned().unwrap_or_default();
+                    b_n = b_shape.iter().product();
+                }
+            }
+
             let out_name = &node.outputs[0];
             let out_n = a_n.max(b_n);
-            bufs.insert(out_name.clone(), inf.output_buffer_f16(out_n));
+            if use_f32 {
+                bufs.insert(out_name.clone(), inf.output_buffer(out_n));
+                f32_bufs.insert(out_name.clone());
+            } else {
+                bufs.insert(out_name.clone(), inf.output_buffer_f16(out_n));
+            }
 
             if a_n == b_n {
                 let out_shape = if a_shape.len() >= b_shape.len() {
@@ -365,24 +537,24 @@ pub(crate) fn record_node(
                     b_shape.clone()
                 };
                 shapes.insert(out_name.clone(), out_shape);
-                let a_nhwc = *nhwc.get(a_name).unwrap_or(&false);
-                nhwc.insert(out_name.clone(), a_nhwc);
+                let a_nhwc_out = *nhwc.get(actual_a.as_str()).unwrap_or(&false);
+                nhwc.insert(out_name.clone(), a_nhwc_out);
                 ops.push(MetalOp::Binary {
-                    a: a_name.clone(),
-                    b: b_name.clone(),
+                    a: actual_a,
+                    b: actual_b,
                     out: out_name.clone(),
                     n: out_n as u32,
                     op,
-                    f16: true,
+                    f16: !use_f32,
                 });
             } else {
                 // Broadcast: smaller tensor broadcasts over larger
-                let (big, small, big_name, small_name) = if a_n > b_n {
-                    (&a_shape, &b_shape, a_name, b_name)
+                let (big, _small, big_name, _small_name) = if a_n > b_n {
+                    (&a_shape, &b_shape, &actual_a, &actual_b)
                 } else {
-                    (&b_shape, &a_shape, b_name, a_name)
+                    (&b_shape, &a_shape, &actual_b, &actual_a)
                 };
-                let broadcast_dim = small.iter().product::<usize>();
+                let broadcast_dim = if a_n > b_n { b_n } else { a_n };
                 shapes.insert(out_name.clone(), big.clone());
                 let big_nhwc = *nhwc.get(big_name.as_str()).unwrap_or(&false);
                 nhwc.insert(out_name.clone(), big_nhwc);
@@ -390,41 +562,55 @@ pub(crate) fn record_node(
                 // For broadcast, a is the big tensor, b is the small
                 if a_n > b_n {
                     ops.push(MetalOp::BroadcastBinary {
-                        a: a_name.clone(),
-                        b: b_name.clone(),
+                        a: actual_a,
+                        b: actual_b,
                         out: out_name.clone(),
                         n: out_n as u32,
                         broadcast_dim: broadcast_dim as u32,
                         op,
-                        f16: true,
+                        f16: !use_f32,
                     });
                 } else {
-                    // Need to swap and adjust op for non-commutative ops
-                    let adjusted_op = if op == 1 { op } else { op }; // sub needs careful handling
+                    // Swap operands: big tensor must be 'a' for broadcast kernel.
+                    let adjusted_op = match op {
+                        1 => 6, // sub → rsub
+                        3 => 7, // div → rdiv
+                        _ => op,
+                    };
                     ops.push(MetalOp::BroadcastBinary {
-                        a: b_name.clone(),
-                        b: a_name.clone(),
+                        a: actual_b,
+                        b: actual_a,
                         out: out_name.clone(),
                         n: out_n as u32,
                         broadcast_dim: broadcast_dim as u32,
                         op: adjusted_op,
-                        f16: true,
+                        f16: !use_f32,
                     });
                 }
             }
         }
 
         "Sigmoid" => {
-            let in_name = &node.inputs[0];
-            let shape = shapes.get(in_name).cloned().unwrap_or_default();
+            // Cast any f32 inputs back to f16
+            let actual_in = resolve_attn_input(
+                inf,
+                &node.inputs[0],
+                false,
+                bufs,
+                shapes,
+                nhwc,
+                ops,
+                f32_bufs,
+            );
+            let shape = shapes.get(&actual_in).cloned().unwrap_or_default();
             let n: usize = shape.iter().product();
             let out_name = &node.outputs[0];
             bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
             shapes.insert(out_name.clone(), shape);
-            let in_nhwc = *nhwc.get(in_name).unwrap_or(&false);
+            let in_nhwc = *nhwc.get(actual_in.as_str()).unwrap_or(&false);
             nhwc.insert(out_name.clone(), in_nhwc);
             ops.push(MetalOp::Unary {
-                input: in_name.clone(),
+                input: actual_in,
                 out: out_name.clone(),
                 n: n as u32,
                 op: 1, // sigmoid
@@ -433,16 +619,25 @@ pub(crate) fn record_node(
         }
 
         "Relu" => {
-            let in_name = &node.inputs[0];
-            let shape = shapes.get(in_name).cloned().unwrap_or_default();
+            let actual_in = resolve_attn_input(
+                inf,
+                &node.inputs[0],
+                false,
+                bufs,
+                shapes,
+                nhwc,
+                ops,
+                f32_bufs,
+            );
+            let shape = shapes.get(&actual_in).cloned().unwrap_or_default();
             let n: usize = shape.iter().product();
             let out_name = &node.outputs[0];
             bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
             shapes.insert(out_name.clone(), shape);
-            let in_nhwc = *nhwc.get(in_name).unwrap_or(&false);
+            let in_nhwc = *nhwc.get(actual_in.as_str()).unwrap_or(&false);
             nhwc.insert(out_name.clone(), in_nhwc);
             ops.push(MetalOp::Unary {
-                input: in_name.clone(),
+                input: actual_in,
                 out: out_name.clone(),
                 n: n as u32,
                 op: 0, // relu
@@ -667,8 +862,8 @@ pub(crate) fn record_node(
 
         "MaxPool" => {
             let in_name = &node.inputs[0];
-            ensure_nhwc_metal(inf, in_name, bufs, shapes, nhwc, ops);
-            let in_shape = shapes.get(in_name).cloned().unwrap_or_default();
+            let nhwc_in = ensure_nhwc_metal(inf, in_name, bufs, shapes, nhwc, ops);
+            let in_shape = shapes.get(&nhwc_in).cloned().unwrap_or_default();
             if in_shape.len() != 4 {
                 return Ok(());
             }
@@ -692,7 +887,7 @@ pub(crate) fn record_node(
             nhwc.insert(out_name.clone(), true);
 
             ops.push(MetalOp::MaxPool {
-                input: in_name.clone(),
+                input: nhwc_in,
                 out: out_name.clone(),
                 batch: n as u32,
                 ih: ih as u32,
@@ -712,8 +907,8 @@ pub(crate) fn record_node(
 
         "Resize" => {
             let in_name = &node.inputs[0];
-            ensure_nhwc_metal(inf, in_name, bufs, shapes, nhwc, ops);
-            let in_shape = shapes.get(in_name).cloned().unwrap_or_default();
+            let nhwc_in = ensure_nhwc_metal(inf, in_name, bufs, shapes, nhwc, ops);
+            let in_shape = shapes.get(&nhwc_in).cloned().unwrap_or_default();
             if in_shape.len() != 4 {
                 return Ok(());
             }
@@ -759,7 +954,7 @@ pub(crate) fn record_node(
             nhwc.insert(out_name.clone(), true);
 
             ops.push(MetalOp::Resize {
-                input: in_name.clone(),
+                input: nhwc_in,
                 out: out_name.clone(),
                 batch: n as u32,
                 ih: ih as u32,
@@ -774,16 +969,21 @@ pub(crate) fn record_node(
         }
 
         "Softmax" => {
-            let in_name = &node.inputs[0];
-            let in_shape = shapes.get(in_name).cloned().unwrap_or_default();
+            let actual_in = resolve_attn_input(
+                inf,
+                &node.inputs[0],
+                is_attn_softmax,
+                bufs,
+                shapes,
+                nhwc,
+                ops,
+                f32_bufs,
+            );
+            let in_shape = shapes.get(&actual_in).cloned().unwrap_or_default();
             let axis = get_attr_int(node, "axis").unwrap_or(-1);
             let ndim = in_shape.len() as i64;
             let actual_axis = if axis < 0 { ndim + axis } else { axis } as usize;
 
-            // Softmax should be over a single axis, not all trailing dims.
-            // outer = product of dims before axis, dim = axis size, inner = product after axis.
-            // If inner > 1, we must handle strided softmax. The GPU kernel currently
-            // only supports contiguous last-dim softmax (inner == 1).
             let outer: usize = in_shape.iter().take(actual_axis).product();
             let softmax_dim: usize = if actual_axis < in_shape.len() {
                 in_shape[actual_axis]
@@ -791,12 +991,12 @@ pub(crate) fn record_node(
                 1
             };
             let inner: usize = in_shape.iter().skip(actual_axis + 1).product();
-            // Treat each (outer, inner) combination as a separate softmax row
             let effective_outer = outer * inner;
             let dim = softmax_dim;
+            let use_f16 = !is_attn_softmax;
             if std::env::var("METAL_DEBUG").is_ok() {
                 eprintln!(
-                    "  [metal] Softmax '{}' shape={:?} axis={} actual_axis={} outer={} dim={} inner={} effective_outer={}",
+                    "  [metal] Softmax '{}' shape={:?} axis={} actual_axis={} outer={} dim={} inner={} effective_outer={} f32={}",
                     node.name,
                     in_shape,
                     axis,
@@ -804,58 +1004,72 @@ pub(crate) fn record_node(
                     outer,
                     softmax_dim,
                     inner,
-                    effective_outer
+                    effective_outer,
+                    is_attn_softmax,
                 );
             }
 
             let out_name = &node.outputs[0];
             let n: usize = in_shape.iter().product();
-            let in_nhwc = *nhwc.get(in_name).unwrap_or(&false);
+            let in_nhwc = *nhwc.get(actual_in.as_str()).unwrap_or(&false);
 
             if inner == 1 {
                 // Contiguous case: axis is last dim, kernel handles directly.
-                // softmax_f16 already uses f32 arithmetic internally.
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                if is_attn_softmax {
+                    bufs.insert(out_name.clone(), inf.output_buffer(n));
+                    f32_bufs.insert(out_name.clone());
+                } else {
+                    bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                }
                 shapes.insert(out_name.clone(), in_shape);
                 nhwc.insert(out_name.clone(), in_nhwc);
 
                 ops.push(MetalOp::Softmax {
-                    input: in_name.clone(),
+                    input: actual_in,
                     out: out_name.clone(),
                     outer: outer as u32,
                     dim: dim as u32,
-                    f16: true,
+                    f16: use_f16,
                 });
             } else if in_shape.len() == 4 && actual_axis == 1 {
                 // Strided softmax on axis=1 of 4D tensor [d0, d1, d2, d3]
-                // Fix: transpose axis to last position, softmax, transpose back
                 let (d0, d1, d2, d3) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
 
-                // Step 1: [d0, d1, d2, d3] → [d0, d2, d3, d1] via nchw_to_nhwc
                 let tmp_pre = format!("{}_softmax_pre", out_name);
-                bufs.insert(tmp_pre.clone(), inf.output_buffer_f16(n));
+                if is_attn_softmax {
+                    bufs.insert(tmp_pre.clone(), inf.output_buffer(n));
+                } else {
+                    bufs.insert(tmp_pre.clone(), inf.output_buffer_f16(n));
+                }
                 ops.push(MetalOp::CpuReshape {
-                    input: in_name.clone(),
+                    input: actual_in,
                     out: tmp_pre.clone(),
                     n: n as u32,
                     nhwc_to_nchw: None,
                     nchw_to_nhwc: Some((d0 as u32, d1 as u32, d2 as u32, d3 as u32)),
-                    f16: true,
+                    f16: use_f16,
                 });
 
-                // Step 2: Softmax on last dim (now contiguous)
                 let tmp_post = format!("{}_softmax_post", out_name);
-                bufs.insert(tmp_post.clone(), inf.output_buffer_f16(n));
+                if is_attn_softmax {
+                    bufs.insert(tmp_post.clone(), inf.output_buffer(n));
+                } else {
+                    bufs.insert(tmp_post.clone(), inf.output_buffer_f16(n));
+                }
                 ops.push(MetalOp::Softmax {
                     input: tmp_pre.clone(),
                     out: tmp_post.clone(),
                     outer: effective_outer as u32,
                     dim: dim as u32,
-                    f16: true,
+                    f16: use_f16,
                 });
 
-                // Step 3: [d0, d2, d3, d1] → [d0, d1, d2, d3] via nhwc_to_nchw
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                if is_attn_softmax {
+                    bufs.insert(out_name.clone(), inf.output_buffer(n));
+                    f32_bufs.insert(out_name.clone());
+                } else {
+                    bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                }
                 shapes.insert(out_name.clone(), in_shape);
                 nhwc.insert(out_name.clone(), in_nhwc);
                 ops.push(MetalOp::CpuReshape {
@@ -864,7 +1078,7 @@ pub(crate) fn record_node(
                     n: n as u32,
                     nhwc_to_nchw: Some((d0 as u32, d2 as u32, d3 as u32, d1 as u32)),
                     nchw_to_nhwc: None,
-                    f16: true,
+                    f16: use_f16,
                 });
             } else {
                 // General strided softmax — fall back to CPU
@@ -879,37 +1093,49 @@ pub(crate) fn record_node(
         }
 
         "Transpose" => {
+            // Transpose is data movement — propagate f32 from input, don't force
             let in_name = &node.inputs[0];
-            let in_shape = shapes.get(in_name).cloned().unwrap_or_default();
+            let in_is_f32 = f32_bufs.contains(in_name.as_str());
+            let in_shape = shapes.get(in_name.as_str()).cloned().unwrap_or_default();
             let perm = get_attr_ints(node, "perm").unwrap_or_default();
+            let use_f16 = !in_is_f32;
+
+            // Helper: allocate output buffer (f32 if input was f32, f16 otherwise)
+            let alloc_out = |inf: &MetalInference,
+                             bufs: &mut HashMap<String, Buffer>,
+                             f32_bufs: &mut HashSet<String>,
+                             name: &str,
+                             n: usize| {
+                if in_is_f32 {
+                    bufs.insert(name.to_string(), inf.output_buffer(n));
+                    f32_bufs.insert(name.to_string());
+                } else {
+                    bufs.insert(name.to_string(), inf.output_buffer_f16(n));
+                }
+            };
 
             if perm == [1, 0] && in_shape.len() == 2 {
-                // True 2D transpose: [rows, cols] → [cols, rows]
                 let rows = in_shape[0];
                 let cols = in_shape[1];
                 let out_name = &node.outputs[0];
                 let n = rows * cols;
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                alloc_out(inf, bufs, f32_bufs, out_name, n);
                 shapes.insert(out_name.clone(), vec![cols, rows]);
                 nhwc.insert(out_name.clone(), false);
-
                 ops.push(MetalOp::Transpose2D {
                     input: in_name.clone(),
                     out: out_name.clone(),
                     rows: rows as u32,
                     cols: cols as u32,
-                    f16: true,
+                    f16: use_f16,
                 });
             } else if perm == [0, 2, 1] && in_shape.len() == 3 {
-                // 3D batched transpose: [d0, d1, d2] → [d0, d2, d1]
-                // Use Permute0213 on [d0, d1, d2, 1] → [d0, d2, d1, 1]
                 let (d0, d1, d2) = (in_shape[0], in_shape[1], in_shape[2]);
                 let out_name = &node.outputs[0];
                 let n = d0 * d1 * d2;
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                alloc_out(inf, bufs, f32_bufs, out_name, n);
                 shapes.insert(out_name.clone(), vec![d0, d2, d1]);
                 nhwc.insert(out_name.clone(), false);
-
                 ops.push(MetalOp::Permute0213 {
                     input: in_name.clone(),
                     out: out_name.clone(),
@@ -917,16 +1143,13 @@ pub(crate) fn record_node(
                     d1: d1 as u32,
                     d2: d2 as u32,
                     d3: 1u32,
-                    f16: true,
+                    f16: use_f16,
                 });
             } else if perm == [0, 1, 3, 2] && in_shape.len() == 4 {
-                // 4D transpose: swap last two dims
-                // Use Permute0213 on [d0*d1, d2, d3, 1] → [d0*d1, d3, d2, 1]
-                // which is batched transpose of [d2, d3] → [d3, d2]
                 let (d0, d1, d2, d3) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
                 let out_name = &node.outputs[0];
                 let n = d0 * d1 * d2 * d3;
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                alloc_out(inf, bufs, f32_bufs, out_name, n);
                 shapes.insert(out_name.clone(), vec![d0, d1, d3, d2]);
                 nhwc.insert(out_name.clone(), false);
                 ops.push(MetalOp::Permute0213 {
@@ -936,17 +1159,15 @@ pub(crate) fn record_node(
                     d1: d2 as u32,
                     d2: d3 as u32,
                     d3: 1u32,
-                    f16: true,
+                    f16: use_f16,
                 });
             } else if perm == [0, 2, 1, 3] && in_shape.len() == 4 {
-                // 4D transpose: swap dim1 and dim2
                 let (d0, d1, d2, d3) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
                 let out_name = &node.outputs[0];
                 let n = d0 * d1 * d2 * d3;
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                alloc_out(inf, bufs, f32_bufs, out_name, n);
                 shapes.insert(out_name.clone(), vec![d0, d2, d1, d3]);
                 nhwc.insert(out_name.clone(), false);
-
                 ops.push(MetalOp::Permute0213 {
                     input: in_name.clone(),
                     out: out_name.clone(),
@@ -954,55 +1175,45 @@ pub(crate) fn record_node(
                     d1: d1 as u32,
                     d2: d2 as u32,
                     d3: d3 as u32,
-                    f16: true,
+                    f16: use_f16,
                 });
             } else if perm == [0, 3, 1, 2] && in_shape.len() == 4 {
-                // NHWC → NCHW: [N, H, W, C] → [N, C, H, W]
                 let (n_dim, h, w, c) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
                 let out_name = &node.outputs[0];
                 let n = n_dim * h * w * c;
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                alloc_out(inf, bufs, f32_bufs, out_name, n);
                 shapes.insert(out_name.clone(), vec![n_dim, c, h, w]);
                 nhwc.insert(out_name.clone(), false);
-
                 ops.push(MetalOp::CpuReshape {
                     input: in_name.clone(),
                     out: out_name.clone(),
                     n: n as u32,
                     nhwc_to_nchw: Some((n_dim as u32, h as u32, w as u32, c as u32)),
                     nchw_to_nhwc: None,
-                    f16: true,
+                    f16: use_f16,
                 });
             } else if perm == [0, 2, 3, 1] && in_shape.len() == 4 {
-                // NCHW → NHWC: [N, C, H, W] → [N, H, W, C]
                 let (n_dim, c, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
                 let out_name = &node.outputs[0];
                 let n = n_dim * c * h * w;
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                alloc_out(inf, bufs, f32_bufs, out_name, n);
                 shapes.insert(out_name.clone(), vec![n_dim, h, w, c]);
                 nhwc.insert(out_name.clone(), true);
-
                 ops.push(MetalOp::CpuReshape {
                     input: in_name.clone(),
                     out: out_name.clone(),
                     n: n as u32,
                     nhwc_to_nchw: None,
                     nchw_to_nhwc: Some((n_dim as u32, c as u32, h as u32, w as u32)),
-                    f16: true,
+                    f16: use_f16,
                 });
             } else if perm == [0, 3, 2, 1] && in_shape.len() == 4 {
-                // [d0, d1, d2, d3] → [d0, d3, d2, d1]
-                // Decompose into two correct 4D permutations:
-                // Step 1: Permute0213 [d0, d1, d2, d3] → [d0, d2, d1, d3]
-                // Step 2: NHWC→NCHW [d0, d2, d1, d3] → [d0, d3, d2, d1]
                 let (d0, d1, d2, d3) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
                 let out_name = &node.outputs[0];
                 let n = d0 * d1 * d2 * d3;
 
-                // Step 1: swap dim1↔dim2: [d0, d1, d2, d3] → [d0, d2, d1, d3]
                 let tmp_name = format!("{}_perm_tmp", out_name);
-                bufs.insert(tmp_name.clone(), inf.output_buffer_f16(n));
-
+                alloc_out(inf, bufs, f32_bufs, &tmp_name, n);
                 ops.push(MetalOp::Permute0213 {
                     input: in_name.clone(),
                     out: tmp_name.clone(),
@@ -1010,21 +1221,19 @@ pub(crate) fn record_node(
                     d1: d1 as u32,
                     d2: d2 as u32,
                     d3: d3 as u32,
-                    f16: true,
+                    f16: use_f16,
                 });
 
-                // Step 2: NHWC→NCHW on [d0, d2, d1, d3] → [d0, d3, d2, d1]
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(n));
+                alloc_out(inf, bufs, f32_bufs, out_name, n);
                 shapes.insert(out_name.clone(), vec![d0, d3, d2, d1]);
                 nhwc.insert(out_name.clone(), false);
-
                 ops.push(MetalOp::CpuReshape {
                     input: tmp_name,
                     out: out_name.clone(),
                     n: n as u32,
                     nhwc_to_nchw: Some((d0 as u32, d2 as u32, d1 as u32, d3 as u32)),
                     nchw_to_nhwc: None,
-                    f16: true,
+                    f16: use_f16,
                 });
             } else {
                 if std::env::var("METAL_DEBUG").is_ok() {
@@ -1038,10 +1247,28 @@ pub(crate) fn record_node(
         }
 
         "MatMul" => {
-            let a_name = &node.inputs[0];
-            let b_name = &node.inputs[1];
-            let a_shape = shapes.get(a_name).cloned().unwrap_or_default();
-            let b_shape = shapes.get(b_name).cloned().unwrap_or_default();
+            let actual_a = resolve_attn_input(
+                inf,
+                &node.inputs[0],
+                is_attn_matmul,
+                bufs,
+                shapes,
+                nhwc,
+                ops,
+                f32_bufs,
+            );
+            let actual_b = resolve_attn_input(
+                inf,
+                &node.inputs[1],
+                is_attn_matmul,
+                bufs,
+                shapes,
+                nhwc,
+                ops,
+                f32_bufs,
+            );
+            let a_shape = shapes.get(&actual_a).cloned().unwrap_or_default();
+            let b_shape = shapes.get(&actual_b).cloned().unwrap_or_default();
 
             if a_shape.len() >= 2 && b_shape.len() >= 2 {
                 let m = a_shape.iter().rev().skip(1).product::<usize>();
@@ -1050,7 +1277,12 @@ pub(crate) fn record_node(
 
                 let out_name = &node.outputs[0];
                 let out_n = m * n;
-                bufs.insert(out_name.clone(), inf.output_buffer_f16(out_n));
+                if is_attn_matmul {
+                    bufs.insert(out_name.clone(), inf.output_buffer(out_n));
+                    f32_bufs.insert(out_name.clone());
+                } else {
+                    bufs.insert(out_name.clone(), inf.output_buffer_f16(out_n));
+                }
 
                 let mut out_shape = a_shape.clone();
                 if let Some(last) = out_shape.last_mut() {
@@ -1060,13 +1292,13 @@ pub(crate) fn record_node(
                 nhwc.insert(out_name.clone(), false);
 
                 ops.push(MetalOp::MatMul {
-                    a: a_name.clone(),
-                    b: b_name.clone(),
+                    a: actual_a,
+                    b: actual_b,
                     out: out_name.clone(),
                     m: m as u32,
                     n: n as u32,
                     k: k as u32,
-                    f16: true,
+                    f16: !is_attn_matmul,
                 });
             }
         }
@@ -1092,20 +1324,29 @@ pub(crate) fn record_node(
 
             ensure_on_metal(inf, in_name, env, bufs, shapes, nhwc);
 
-            // If input is NHWC and we're reshaping to non-4D,
-            // we need to convert NHWC→NCHW first (will happen at runtime via CpuReshape)
             let in_is_nhwc = *nhwc.get(in_name).unwrap_or(&false);
             let in_shape = shapes.get(in_name).cloned().unwrap_or_default();
+            let in_is_f32 = f32_bufs.contains(in_name.as_str());
 
-            // For Reshape/Flatten/Unsqueeze/Squeeze: data is identical, can alias.
-            // For Expand: data is replicated, must copy.
             if bufs.contains_key(in_name) {
                 let n_in = in_shape.iter().product::<usize>().max(1);
                 let n_out = out_shape.iter().product::<usize>().max(1);
 
+                if std::env::var("METAL_DEBUG").is_ok() {
+                    eprintln!(
+                        "  [Reshape] '{}' in_shape={:?} nhwc={} f32={} → '{}' out_shape={:?} n_in={} n_out={}",
+                        in_name, in_shape, in_is_nhwc, in_is_f32, out_name, out_shape, n_in, n_out
+                    );
+                }
+
                 if in_is_nhwc && in_shape.len() == 4 {
                     // Need NHWC→NCHW permutation — must copy
-                    bufs.insert(out_name.clone(), inf.output_buffer_f16(n_out));
+                    if in_is_f32 {
+                        bufs.insert(out_name.clone(), inf.output_buffer(n_out));
+                        f32_bufs.insert(out_name.clone());
+                    } else {
+                        bufs.insert(out_name.clone(), inf.output_buffer_f16(n_out));
+                    }
                     let (n_dim, h, w, c) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
                     ops.push(MetalOp::CpuReshape {
                         input: in_name.clone(),
@@ -1113,23 +1354,19 @@ pub(crate) fn record_node(
                         n: n_out as u32,
                         nhwc_to_nchw: Some((n_dim as u32, h as u32, w as u32, c as u32)),
                         nchw_to_nhwc: None,
-                        f16: true,
+                        f16: !in_is_f32,
                     });
                 } else if n_in == n_out {
                     // Same element count, no layout change — zero-cost buffer alias
                     let existing_buf = bufs.get(in_name).unwrap().clone();
                     bufs.insert(out_name.clone(), existing_buf);
+                    // Propagate f32 flag through reshape alias
+                    if in_is_f32 {
+                        f32_bufs.insert(out_name.clone());
+                    }
                 } else {
-                    // Element count changed (Expand) — must copy
-                    bufs.insert(out_name.clone(), inf.output_buffer_f16(n_out));
-                    ops.push(MetalOp::CpuReshape {
-                        input: in_name.clone(),
-                        out: out_name.clone(),
-                        n: n_out as u32,
-                        nhwc_to_nchw: None,
-                        nchw_to_nhwc: None,
-                        f16: true,
-                    });
+                    cpu_fallback(node, env, cpu_data, cpu_shapes, bufs, shapes, nhwc, inf);
+                    return Ok(());
                 }
                 shapes.insert(out_name.clone(), out_shape);
                 nhwc.insert(out_name.clone(), false);

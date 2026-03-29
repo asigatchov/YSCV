@@ -260,8 +260,8 @@ CPU performance vs competitors (YOLOv8n 640×640, Apple M1):
 
 | Runtime | YOLOv8n | YOLO11n | Opset 22 |
 |---------|---------|---------|----------|
-| **yscv** | **31.9ms** | **46.0ms** | Yes |
-| onnxruntime 1.19 | 95.4ms (3× slower) | FAILED | No |
+| **yscv** | **31.7ms** | **34.3ms** | Yes |
+| onnxruntime 1.19 | 100.8ms (3.2× slower) | FAILED | No |
 | tract 0.21 | 217.2ms (6.8× slower) | FAILED | No |
 
 Both competitors crash on YOLO11n — onnxruntime lacks opset 22 support, tract fails on TDim parsing. yscv runs both models without issues.
@@ -372,7 +372,7 @@ let plan = compile_metal_plan(&model, "images", &input)?;
 let outputs = run_metal_plan(&plan, &vec![0.5f32; 1*3*640*640])?;
 ```
 
-Metal performance: **4.8ms** on YOLOv8n, **5.9ms** on YOLO11n, **7.8ms** on VballNet (MPSGraph) — 3.4× faster than CoreML on YOLOv8n (16.1ms), 1.1× faster on VballNet (8.6ms). CoreML fails entirely on YOLO11n.
+Metal performance: **3.5ms** on YOLOv8n, **5.0ms** on YOLO11n, **7.8ms** on VballNet (MPSGraph) — 4× faster than CoreML on YOLOv8n (14.2ms), 1.1× faster on VballNet (8.6ms). CoreML fails entirely on YOLO11n.
 
 ---
 
@@ -430,6 +430,65 @@ cargo run --example yolo_detect -- yolov8n.onnx photo.jpg
 ```
 
 The model format (v8 vs v11) is auto-detected from the output tensor shape.
+
+### YOLOv8 vs YOLO11: which model to use
+
+| | YOLOv8n | YOLO11n |
+|---|---------|---------|
+| Architecture | Standard Conv blocks | DWConv + C2PSA attention |
+| FLOPs | 8.7 GFLOP | 6.5 GFLOP |
+| Parameters | 3.2M | 2.6M |
+| CPU inference | 31.7ms | 34.3ms |
+| MPSGraph | 3.5ms | 5.0ms |
+| ORT compatible | Yes | No (opset 22) |
+
+**Use YOLOv8n** when you need maximum compatibility (ORT, CoreML, TensorRT all support it) or fastest absolute speed on both CPU and GPU.
+
+**Use YOLO11n** when you want better accuracy per FLOP. YOLO11n uses C2PSA (cross-stage partial + spatial attention) and depthwise separable convolutions — fewer parameters with better feature extraction. Slightly slower than v8n despite fewer FLOPs because attention blocks (MatMul Q*K^T + Softmax) are memory-bound. Only yscv can run it — ORT and tract crash on opset 22.
+
+Both models produce identical output format `[1, 84, 8400]` — 80 COCO classes + 4 bbox coords, 8400 anchor positions across 3 scales (80x80 + 40x40 + 20x20). The `decode` function auto-detects the format.
+
+### Choosing a backend
+
+```
+MPSGraph (3.5ms)  →  Metal per-op (12.1ms)  →  CPU (31.7ms)
+   fastest              fallback                always works
+```
+
+| Backend | When to use |
+|---------|-------------|
+| **MPSGraph** | Default choice on macOS. Compiles entire model into one GPU dispatch. Fastest by far (3.5ms YOLOv8n). Requires `--features metal-backend`. |
+| **Metal per-op** | Fallback when MPSGraph compilation fails (e.g. dynamic reshape chains, unsupported ops). Still 2.6x faster than CPU. Same feature flag. |
+| **CPU** | No feature flags needed. Works everywhere. 3.2x faster than ORT. Best for Linux/Windows servers, CI, or when GPU isn't available. |
+| **wgpu** | Cross-platform GPU via Vulkan/Metal/DX12. Use `--features gpu`. Slower than Metal-native on macOS but works on all platforms with GPU. |
+
+**Recommended pattern:**
+
+```rust
+// Try MPSGraph → Metal per-op → CPU
+#[cfg(feature = "metal-backend")]
+{
+    match compile_mpsgraph_plan(&model, "images", &input) {
+        Ok(plan) => { /* fastest path */ },
+        Err(_) => {
+            let plan = compile_metal_plan(&model, "images", &input)?;
+            /* metal per-op fallback */
+        }
+    }
+}
+
+#[cfg(not(feature = "metal-backend"))]
+{
+    let outputs = run_onnx_model(&model, inputs)?;  // CPU
+}
+```
+
+### Detection quality notes
+
+All backends produce equivalent detections (±1-2 at confidence threshold boundary):
+- Metal/MPSGraph use f16 intermediates — may detect ±1 object vs CPU at the 0.25 confidence edge
+- CPU uses f32 with platform BLAS (Accelerate on macOS, OpenBLAS on Linux) — minor floating-point differences vs ORT are expected and not a bug
+- DFL (Distribution Focal Loss) in the bbox decoder amplifies small numerical differences exponentially, so bbox coordinates can differ by ~30px between runtimes while detecting the same objects
 
 ---
 
@@ -725,8 +784,9 @@ python benchmarks/python/bench_opencv.py    # vs OpenCV
 
 | What | yscv | Competitor | Speedup |
 |------|------|-----------|---------|
-| YOLOv8n CPU | 31.9ms | onnxruntime 95.4ms | **3x** |
-| YOLOv8n Metal | **11.8ms** | CoreML 13.4ms | **WIN** (14% faster) |
+| YOLOv8n CPU | 31.7ms | onnxruntime 100.8ms | **3.2x** |
+| YOLOv8n MPSGraph | **3.5ms** | CoreML 14.2ms | **4.1x** |
+| YOLO11n CPU | 34.3ms | onnxruntime FAIL | only yscv |
 | sigmoid 921K | 0.217ms | PyTorch 1.296ms | **6.0x** |
 | resize nearest u8 | 0.048ms | OpenCV 0.157ms | **3.3x** |
 | detect+track pipeline | 0.067ms | — | 15,000 FPS |

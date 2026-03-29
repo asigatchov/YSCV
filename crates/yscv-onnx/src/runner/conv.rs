@@ -143,10 +143,15 @@ pub(super) fn exec_conv(
                 message: e.to_string(),
             }
         })?;
-        let out_nhwc = yscv_kernels::depthwise_conv2d_nhwc(input_padded, &dw_kernel, bias, sh, sw)
-            .map_err(|e| OnnxError::DecodeFailed {
-                message: e.to_string(),
-            })?;
+        let mut out_nhwc =
+            yscv_kernels::depthwise_conv2d_nhwc(input_padded, &dw_kernel, bias, sh, sw).map_err(
+                |e| OnnxError::DecodeFailed {
+                    message: e.to_string(),
+                },
+            )?;
+        if activation == yscv_kernels::Activation::Silu {
+            yscv_kernels::silu_inplace(&mut out_nhwc);
+        }
         env.insert(node.outputs[0].clone(), out_nhwc);
         env.mark_nhwc(&node.outputs[0]);
     } else {
@@ -203,11 +208,14 @@ pub(super) fn exec_conv(
                 }
             }
         }
-        let out_nhwc = Tensor::from_vec(vec![n, oh, ow, o_ch], out_data).map_err(|e| {
+        let mut out_nhwc = Tensor::from_vec(vec![n, oh, ow, o_ch], out_data).map_err(|e| {
             OnnxError::DecodeFailed {
                 message: e.to_string(),
             }
         })?;
+        if activation == yscv_kernels::Activation::Silu {
+            yscv_kernels::silu_inplace(&mut out_nhwc);
+        }
         env.insert(node.outputs[0].clone(), out_nhwc);
         env.mark_nhwc(&node.outputs[0]);
     }

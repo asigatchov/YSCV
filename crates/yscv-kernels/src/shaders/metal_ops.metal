@@ -5,7 +5,7 @@
 using namespace metal;
 
 // ── Elementwise binary ops ──────────────────────────────────────
-// op: 0=add, 1=sub, 2=mul, 3=div, 4=max, 5=min
+// op: 0=add, 1=sub, 2=mul, 3=div, 4=max, 5=min, 6=rsub(b-a), 7=rdiv(b/a)
 struct BinaryParams { uint n; uint op; };
 
 kernel void binary_elementwise(
@@ -48,6 +48,8 @@ kernel void broadcast_binary(
         case 1: r = va - vb; break;
         case 2: r = va * vb; break;
         case 3: r = va / vb; break;
+        case 6: r = vb - va; break;  // rsub: reversed operands
+        case 7: r = vb / va; break;  // rdiv: reversed operands
         default: r = va + vb;
     }
     out[tid] = r;
@@ -363,9 +365,8 @@ kernel void permute_nchw_to_nhwc(
     out[((nn * p.h + hh) * p.w + ww) * p.c + cc] = input[tid];
 }
 
-// ── Matmul (tiled, f16 accumulators) ────────────────────────────
+// ── Matmul (tiled, f32 shared memory + f32 accumulators) ────────
 // BM=64, BN=64, BK=16, TM=4, TN=4 — 16×16=256 threads, 16 accumulators/thread.
-// Matching conv_gemm_basic tile sizes for proven occupancy (~100%).
 
 struct MatmulParams { uint m; uint n; uint k; };
 
@@ -385,51 +386,45 @@ kernel void matmul(
     uint2 lid  [[thread_position_in_threadgroup]],
     uint2 gid  [[threadgroup_position_in_grid]]
 ) {
-    threadgroup half sa[MM_BM * MM_SA_STRIDE];   // 64 × 17 = 1088
-    threadgroup half sb[MM_BK * MM_SB_STRIDE];   // 16 × 65 = 1040
+    threadgroup float sa[MM_BM * MM_SA_STRIDE];
+    threadgroup float sb[MM_BK * MM_SB_STRIDE];
 
-    const uint tx = lid.x;  // 0..15
-    const uint ty = lid.y;  // 0..15
+    const uint tx = lid.x;
+    const uint ty = lid.y;
     const uint tid = ty * 16 + tx;
 
     const uint row0 = gid.y * MM_BM;
     const uint col0 = gid.x * MM_BN;
 
-    // 4×4 = 16 accumulators per thread
-    half4 acc0 = half4(0.0h);
-    half4 acc1 = half4(0.0h);
-    half4 acc2 = half4(0.0h);
-    half4 acc3 = half4(0.0h);
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+    float4 acc2 = float4(0.0f);
+    float4 acc3 = float4(0.0f);
 
     const uint tiles = (p.k + MM_BK - 1) / MM_BK;
     for (uint t = 0; t < tiles; t++) {
         const uint k0 = t * MM_BK;
 
-        // Load A: BM × BK = 1024 elements, 256 threads → 4 elements/thread
         for (uint i = 0; i < 4; i++) {
             const uint idx = tid + i * 256;
-            const uint r = idx >> 4;   // / 16
-            const uint c = idx & 15;   // % 16
+            const uint r = idx >> 4;
+            const uint c = idx & 15;
             const uint gr = row0 + r;
             const uint gk = k0 + c;
-            half val = (gr < p.m && gk < p.k) ? half(a[gr * p.k + gk]) : 0.0h;
-            sa[r * MM_SA_STRIDE + c] = val;
+            sa[r * MM_SA_STRIDE + c] = (gr < p.m && gk < p.k) ? a[gr * p.k + gk] : 0.0f;
         }
 
-        // Load B: BK × BN = 1024 elements, 256 threads → 4 elements/thread
         for (uint i = 0; i < 4; i++) {
             const uint idx = tid + i * 256;
-            const uint r = idx >> 6;   // / 64
-            const uint c = idx & 63;   // % 64
+            const uint r = idx >> 6;
+            const uint c = idx & 63;
             const uint gr = k0 + r;
             const uint gc = col0 + c;
-            half val = (gr < p.k && gc < p.n) ? half(b[gr * p.n + gc]) : 0.0h;
-            sb[r * MM_SB_STRIDE + c] = val;
+            sb[r * MM_SB_STRIDE + c] = (gr < p.k && gc < p.n) ? b[gr * p.n + gc] : 0.0f;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Inner compute — fully unrolled BK=16 steps
         const uint b_base = tx * MM_TN;
         const uint a_base0 = (ty * MM_TM + 0) * MM_SA_STRIDE;
         const uint a_base1 = (ty * MM_TM + 1) * MM_SA_STRIDE;
@@ -437,45 +432,42 @@ kernel void matmul(
         const uint a_base3 = (ty * MM_TM + 3) * MM_SA_STRIDE;
 
         for (uint kk = 0; kk < MM_BK; kk++) {
-            half4 bv = half4(
+            float4 bv = float4(
                 sb[kk * MM_SB_STRIDE + b_base],
                 sb[kk * MM_SB_STRIDE + b_base + 1],
                 sb[kk * MM_SB_STRIDE + b_base + 2],
                 sb[kk * MM_SB_STRIDE + b_base + 3]
             );
-            acc0 = fma(half4(sa[a_base0 + kk]), bv, acc0);
-            acc1 = fma(half4(sa[a_base1 + kk]), bv, acc1);
-            acc2 = fma(half4(sa[a_base2 + kk]), bv, acc2);
-            acc3 = fma(half4(sa[a_base3 + kk]), bv, acc3);
+            acc0 = fma(float4(sa[a_base0 + kk]), bv, acc0);
+            acc1 = fma(float4(sa[a_base1 + kk]), bv, acc1);
+            acc2 = fma(float4(sa[a_base2 + kk]), bv, acc2);
+            acc3 = fma(float4(sa[a_base3 + kk]), bv, acc3);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Store: f16 → f32
     const uint c = col0 + tx * MM_TN;
     if (c + 3 < p.n) {
-        half4 accs[4] = { acc0, acc1, acc2, acc3 };
+        float4 accs[4] = { acc0, acc1, acc2, acc3 };
         for (uint ri = 0; ri < MM_TM; ri++) {
             const uint r = row0 + ty * MM_TM + ri;
             if (r >= p.m) continue;
-            float4 v = float4(accs[ri]);
             const uint base = r * p.n + c;
-            out[base]     = v.x;
-            out[base + 1] = v.y;
-            out[base + 2] = v.z;
-            out[base + 3] = v.w;
+            out[base]     = accs[ri].x;
+            out[base + 1] = accs[ri].y;
+            out[base + 2] = accs[ri].z;
+            out[base + 3] = accs[ri].w;
         }
     } else {
-        half4 accs[4] = { acc0, acc1, acc2, acc3 };
+        float4 accs[4] = { acc0, acc1, acc2, acc3 };
         for (uint ri = 0; ri < MM_TM; ri++) {
             const uint r = row0 + ty * MM_TM + ri;
             if (r >= p.m) continue;
-            float4 acc_f32 = float4(accs[ri]);
             for (uint ci = 0; ci < MM_TN; ci++) {
                 const uint col = c + ci;
                 if (col < p.n) {
-                    out[r * p.n + col] = acc_f32[ci];
+                    out[r * p.n + col] = accs[ri][ci];
                 }
             }
         }
@@ -571,6 +563,8 @@ kernel void broadcast_binary_f16(
         case 1: r = va - vb; break;
         case 2: r = va * vb; break;
         case 3: r = va / vb; break;
+        case 6: r = vb - va; break;  // rsub: reversed operands
+        case 7: r = vb / va; break;  // rdiv: reversed operands
         default: r = va + vb;
     }
     out[tid] = half(clamp(r, -65504.0f, 65504.0f));
@@ -847,9 +841,7 @@ kernel void softmax_f16(
 
     float local_sum = 0.0f;
     for (uint i = lid; i < p.dim; i += tg_size) {
-        float e = exp(float(input[base + i]) - max_val);
-        out[base + i] = half(e);
-        local_sum += e;
+        local_sum += exp(float(input[base + i]) - max_val);
     }
     shared[lid] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -860,8 +852,9 @@ kernel void softmax_f16(
     float inv_sum = 1.0f / shared[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Recompute exp to avoid f16 intermediate clipping
     for (uint i = lid; i < p.dim; i += tg_size) {
-        out[base + i] = half(float(out[base + i]) * inv_sum);
+        out[base + i] = half(exp(float(input[base + i]) - max_val) * inv_sum);
     }
 }
 
@@ -885,18 +878,16 @@ kernel void softmax_scalar_f16(
         max_val = max(max_val, float(input[base + i]));
     }
 
-    // Pass 2: exp and sum, write exp to output
+    // Pass 2: sum of exp (no f16 intermediate to avoid clipping)
     float sum = 0.0f;
     for (uint i = 0; i < dim; i++) {
-        float e = exp(float(input[base + i]) - max_val);
-        out[base + i] = half(e);
-        sum += e;
+        sum += exp(float(input[base + i]) - max_val);
     }
 
-    // Pass 3: normalize
+    // Pass 3: normalize — recompute exp to avoid f16 precision loss
     float inv_sum = 1.0f / sum;
     for (uint i = 0; i < dim; i++) {
-        out[base + i] = half(float(out[base + i]) * inv_sum);
+        out[base + i] = half(exp(float(input[base + i]) - max_val) * inv_sum);
     }
 }
 

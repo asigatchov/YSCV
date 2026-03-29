@@ -1981,24 +1981,70 @@ fn exec_softmax(
     gc: &mut GpuCache,
 ) -> Result<(), OnnxError> {
     let name = &node.inputs[0];
-    to_gpu(gpu, name, env, gc);
 
-    let (out, nhwc) = {
-        let gt = gc.get(name).ok_or_else(|| OnnxError::MissingInput {
-            node: node.name.clone(),
-            input: name.clone(),
-        })?;
-        (gpu.softmax_on_device(&gt.buf), gt.nhwc)
+    // Resolve axis attribute
+    let ndim = gc
+        .get(name)
+        .map(|gt| gt.buf.shape().len())
+        .or_else(|| env.get(name).map(|t| t.rank()))
+        .unwrap_or(0);
+    let raw_axis = get_attr_int(node, "axis").unwrap_or(-1);
+    let axis = if raw_axis < 0 {
+        (ndim as i64 + raw_axis) as usize
+    } else {
+        raw_axis as usize
     };
 
-    gc.insert(
-        node.outputs[0].clone(),
-        GpuTensor {
-            buf: out,
-            nhwc,
-            f16_io: false,
-        },
-    );
+    if axis == ndim - 1 {
+        // Fast path: softmax on last dim — run on GPU
+        to_gpu(gpu, name, env, gc);
+        let (out, nhwc) = {
+            let gt = gc.get(name).ok_or_else(|| OnnxError::MissingInput {
+                node: node.name.clone(),
+                input: name.clone(),
+            })?;
+            (gpu.softmax_on_device(&gt.buf), gt.nhwc)
+        };
+        gc.insert(
+            node.outputs[0].clone(),
+            GpuTensor {
+                buf: out,
+                nhwc,
+                f16_io: false,
+            },
+        );
+    } else {
+        // Non-last axis: fall back to CPU (transpose + softmax + transpose)
+        to_gpu(gpu, name, env, gc);
+        let input = {
+            let gt = gc.get(name).ok_or_else(|| OnnxError::MissingInput {
+                node: node.name.clone(),
+                input: name.clone(),
+            })?;
+            gpu.download(&gt.buf)
+        };
+        let mut perm: Vec<usize> = (0..ndim).collect();
+        perm.swap(axis, ndim - 1);
+        let transposed = input.permute(&perm).map_err(|e| OnnxError::DecodeFailed {
+            message: e.to_string(),
+        })?;
+        let sm = softmax_last_dim(&transposed).map_err(|e| OnnxError::DecodeFailed {
+            message: e.to_string(),
+        })?;
+        let result = sm.permute(&perm).map_err(|e| OnnxError::DecodeFailed {
+            message: e.to_string(),
+        })?;
+        // Upload result back to GPU
+        let gpu_buf = gpu.upload(&result);
+        gc.insert(
+            node.outputs[0].clone(),
+            GpuTensor {
+                buf: gpu_buf,
+                nhwc: false,
+                f16_io: false,
+            },
+        );
+    }
     Ok(())
 }
 

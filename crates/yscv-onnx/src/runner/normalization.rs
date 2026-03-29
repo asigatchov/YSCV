@@ -64,9 +64,33 @@ pub(super) fn exec_batch_norm(node: &OnnxNode, env: &mut TensorEnv) -> Result<()
 
 pub(super) fn exec_softmax(node: &OnnxNode, env: &mut TensorEnv) -> Result<(), OnnxError> {
     let input = get_tensor(env, &node.name, &node.inputs[0])?;
-    let out = softmax_last_dim(input).map_err(|e| OnnxError::DecodeFailed {
-        message: e.to_string(),
-    })?;
+    let ndim = input.rank();
+    let raw_axis = get_attr_int(node, "axis").unwrap_or(-1);
+    let axis = if raw_axis < 0 {
+        (ndim as i64 + raw_axis) as usize
+    } else {
+        raw_axis as usize
+    };
+
+    let out = if axis == ndim - 1 {
+        // Fast path: softmax on last dim (most common case)
+        softmax_last_dim(input).map_err(|e| OnnxError::DecodeFailed {
+            message: e.to_string(),
+        })?
+    } else {
+        // Transpose target axis to last, softmax, transpose back.
+        let mut perm: Vec<usize> = (0..ndim).collect();
+        perm.swap(axis, ndim - 1);
+        let transposed = input.permute(&perm).map_err(|e| OnnxError::DecodeFailed {
+            message: e.to_string(),
+        })?;
+        let sm = softmax_last_dim(&transposed).map_err(|e| OnnxError::DecodeFailed {
+            message: e.to_string(),
+        })?;
+        sm.permute(&perm).map_err(|e| OnnxError::DecodeFailed {
+            message: e.to_string(),
+        })?
+    };
     env.insert(node.outputs[0].clone(), out);
     Ok(())
 }
