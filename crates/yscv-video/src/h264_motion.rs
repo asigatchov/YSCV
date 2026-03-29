@@ -146,6 +146,79 @@ pub fn motion_compensate_halfpel(
 }
 
 // ---------------------------------------------------------------------------
+// Weighted prediction (H.264 7.4.3.2)
+// ---------------------------------------------------------------------------
+
+/// Apply uni-directional weighted prediction to a 16x16 block in-place.
+///
+/// For each sample: `out = clip((log2_denom == 0 ? 0 : (1 << (log2_denom-1))) + weight * pred + (offset << log2_denom)) >> log2_denom`
+/// Simplified: `out = clip(((weight * pred + round) >> log2_denom) + offset)`
+#[allow(clippy::too_many_arguments)]
+pub fn apply_weighted_pred(
+    plane: &mut [u8],
+    stride: usize,
+    bx: usize,
+    by: usize,
+    block_w: usize,
+    block_h: usize,
+    weight: i32,
+    offset: i32,
+    log2_denom: u32,
+) {
+    let round = if log2_denom > 0 {
+        1i32 << (log2_denom - 1)
+    } else {
+        0
+    };
+    for row in 0..block_h {
+        for col in 0..block_w {
+            let idx = (by + row) * stride + bx + col;
+            if idx < plane.len() {
+                let pred = plane[idx] as i32;
+                let val = ((weight * pred + round) >> log2_denom) + offset;
+                plane[idx] = val.clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// Apply bi-directional weighted prediction to a 16x16 block.
+///
+/// `out = clip(((w0 * pred0 + w1 * pred1 + round) >> (log2_denom + 1)) + ((o0 + o1 + 1) >> 1))`
+#[allow(clippy::too_many_arguments)]
+pub fn apply_bipred_weighted(
+    output: &mut [u8],
+    stride: usize,
+    bx: usize,
+    by: usize,
+    block_w: usize,
+    block_h: usize,
+    pred0: &[u8],
+    pred1: &[u8],
+    pred_stride: usize,
+    w0: i32,
+    o0: i32,
+    w1: i32,
+    o1: i32,
+    log2_denom: u32,
+) {
+    let round = 1i32 << log2_denom;
+    let offset = (o0 + o1 + 1) >> 1;
+    let shift = log2_denom + 1;
+    for row in 0..block_h {
+        for col in 0..block_w {
+            let p0 = pred0[row * pred_stride + col] as i32;
+            let p1 = pred1[row * pred_stride + col] as i32;
+            let val = ((w0 * p0 + w1 * p1 + round) >> shift) + offset;
+            let idx = (by + row) * stride + bx + col;
+            if idx < output.len() {
+                output[idx] = val.clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // P-slice macroblock decoder
 // ---------------------------------------------------------------------------
 

@@ -14,8 +14,9 @@
 //! - FMO (Flexible Macroblock Ordering) — slice group map types 0–6
 //! - High 4:2:2 (profile_idc=122) and High 4:4:4 Predictive (profile_idc=244) profiles
 //!
+//! - CABAC entropy coding (Main/High profile)
+//!
 //! ## Not supported
-//! - CABAC entropy coding (High profile)
 //! - Weighted prediction (explicit mode)
 //! - ASO (Arbitrary Slice Ordering)
 //! - SI/SP slices
@@ -27,6 +28,11 @@
 //! with untrusted input, consider FFI to libavcodec.
 
 use crate::{DecodedFrame, NalUnit, NalUnitType, VideoCodec, VideoDecoder, VideoError};
+
+use super::h264_cabac::{
+    self, CabacContext, CabacDecoder, decode_coded_block_flag, decode_mb_type_i_slice,
+    decode_residual_block_cabac, init_cabac_contexts,
+};
 
 // ---------------------------------------------------------------------------
 // Bitstream reader (bit-level access for Exp-Golomb / SPS / PPS parsing)
@@ -314,7 +320,7 @@ fn skip_scaling_list(r: &mut BitstreamReader<'_>, size: usize) -> Result<(), Vid
 }
 
 /// Removes H.264 emulation prevention bytes (0x00 0x00 0x03 -> 0x00 0x00).
-fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
+pub(crate) fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
@@ -356,6 +362,8 @@ pub struct Pps {
     pub slice_group_id: Vec<u32>,
     pub num_ref_idx_l0_default_active: u32,
     pub num_ref_idx_l1_default_active: u32,
+    pub weighted_pred_flag: bool,
+    pub weighted_bipred_idc: u32,
     pub pic_init_qp: i32,
 }
 
@@ -420,10 +428,8 @@ pub fn parse_pps(nal_data: &[u8]) -> Result<Pps, VideoError> {
 
     let num_ref_idx_l0_default_active = r.read_ue()? + 1;
     let num_ref_idx_l1_default_active = r.read_ue()? + 1;
-    // weighted_pred_flag
-    let _weighted_pred_flag = r.read_bit()?;
-    // weighted_bipred_idc
-    let _weighted_bipred_idc = r.read_bits(2)?;
+    let weighted_pred_flag = r.read_bit()? == 1;
+    let weighted_bipred_idc = r.read_bits(2)?;
     // pic_init_qp_minus26
     let pic_init_qp_minus26 = r.read_se()?;
     let pic_init_qp = 26 + pic_init_qp_minus26;
@@ -442,6 +448,8 @@ pub fn parse_pps(nal_data: &[u8]) -> Result<Pps, VideoError> {
         slice_group_id,
         num_ref_idx_l0_default_active,
         num_ref_idx_l1_default_active,
+        weighted_pred_flag,
+        weighted_bipred_idc,
         pic_init_qp,
     })
 }
@@ -449,6 +457,30 @@ pub fn parse_pps(nal_data: &[u8]) -> Result<Pps, VideoError> {
 // ---------------------------------------------------------------------------
 // Slice header
 // ---------------------------------------------------------------------------
+
+/// Weighted prediction parameters for one reference picture + component.
+#[derive(Debug, Clone, Default)]
+pub struct WeightEntry {
+    /// Weight value. Default = (1 << log2_weight_denom).
+    pub weight: i32,
+    /// Offset value. Default = 0.
+    pub offset: i32,
+}
+
+/// Weighted prediction table parsed from the slice header.
+#[derive(Debug, Clone, Default)]
+pub struct WeightTable {
+    pub luma_log2_denom: u32,
+    pub chroma_log2_denom: u32,
+    /// Per-reference luma weights for L0 list.
+    pub luma_l0: Vec<WeightEntry>,
+    /// Per-reference chroma weights for L0 list (Cb, Cr per ref).
+    pub chroma_l0: Vec<[WeightEntry; 2]>,
+    /// Per-reference luma weights for L1 list (B-slices).
+    pub luma_l1: Vec<WeightEntry>,
+    /// Per-reference chroma weights for L1 list (Cb, Cr per ref).
+    pub chroma_l1: Vec<[WeightEntry; 2]>,
+}
 
 /// Parsed slice header (subset of fields needed for IDR decoding).
 #[derive(Debug, Clone)]
@@ -462,6 +494,137 @@ pub struct SliceHeader {
     /// When `field_pic_flag` is true, indicates this is the bottom field.
     pub bottom_field_flag: bool,
     pub qp: i32,
+    /// Weighted prediction table (populated when PPS weighted_pred_flag is set).
+    pub weight_table: Option<WeightTable>,
+}
+
+/// Parses the pred_weight_table() from the slice header (H.264 7.3.3.2).
+fn parse_weight_table(
+    r: &mut BitstreamReader<'_>,
+    slice_type: u32,
+    num_ref_l0: u32,
+    num_ref_l1: u32,
+    chroma_format_idc: u32,
+) -> Result<WeightTable, VideoError> {
+    let luma_log2_denom = r.read_ue()?;
+    let chroma_log2_denom = if chroma_format_idc > 0 {
+        r.read_ue()?
+    } else {
+        0
+    };
+
+    let luma_default = 1i32 << luma_log2_denom;
+    let chroma_default = 1i32 << chroma_log2_denom;
+
+    let mut luma_l0 = Vec::new();
+    let mut chroma_l0 = Vec::new();
+    for _ in 0..num_ref_l0 {
+        let luma_weight_flag = r.read_bit()? == 1;
+        if luma_weight_flag {
+            let w = r.read_se()?;
+            let o = r.read_se()?;
+            luma_l0.push(WeightEntry {
+                weight: w,
+                offset: o,
+            });
+        } else {
+            luma_l0.push(WeightEntry {
+                weight: luma_default,
+                offset: 0,
+            });
+        }
+        if chroma_format_idc > 0 {
+            let chroma_weight_flag = r.read_bit()? == 1;
+            if chroma_weight_flag {
+                let w_cb = r.read_se()?;
+                let o_cb = r.read_se()?;
+                let w_cr = r.read_se()?;
+                let o_cr = r.read_se()?;
+                chroma_l0.push([
+                    WeightEntry {
+                        weight: w_cb,
+                        offset: o_cb,
+                    },
+                    WeightEntry {
+                        weight: w_cr,
+                        offset: o_cr,
+                    },
+                ]);
+            } else {
+                chroma_l0.push([
+                    WeightEntry {
+                        weight: chroma_default,
+                        offset: 0,
+                    },
+                    WeightEntry {
+                        weight: chroma_default,
+                        offset: 0,
+                    },
+                ]);
+            }
+        }
+    }
+
+    let mut luma_l1 = Vec::new();
+    let mut chroma_l1 = Vec::new();
+    // B-slices: slice_type == 1 or 6
+    if slice_type == 1 || slice_type == 6 {
+        for _ in 0..num_ref_l1 {
+            let luma_weight_flag = r.read_bit()? == 1;
+            if luma_weight_flag {
+                let w = r.read_se()?;
+                let o = r.read_se()?;
+                luma_l1.push(WeightEntry {
+                    weight: w,
+                    offset: o,
+                });
+            } else {
+                luma_l1.push(WeightEntry {
+                    weight: luma_default,
+                    offset: 0,
+                });
+            }
+            if chroma_format_idc > 0 {
+                let chroma_weight_flag = r.read_bit()? == 1;
+                if chroma_weight_flag {
+                    let w_cb = r.read_se()?;
+                    let o_cb = r.read_se()?;
+                    let w_cr = r.read_se()?;
+                    let o_cr = r.read_se()?;
+                    chroma_l1.push([
+                        WeightEntry {
+                            weight: w_cb,
+                            offset: o_cb,
+                        },
+                        WeightEntry {
+                            weight: w_cr,
+                            offset: o_cr,
+                        },
+                    ]);
+                } else {
+                    chroma_l1.push([
+                        WeightEntry {
+                            weight: chroma_default,
+                            offset: 0,
+                        },
+                        WeightEntry {
+                            weight: chroma_default,
+                            offset: 0,
+                        },
+                    ]);
+                }
+            }
+        }
+    }
+
+    Ok(WeightTable {
+        luma_log2_denom,
+        chroma_log2_denom,
+        luma_l0,
+        chroma_l0,
+        luma_l1,
+        chroma_l1,
+    })
 }
 
 /// Parses a slice header from RBSP data (after the NAL header byte).
@@ -500,6 +663,24 @@ fn parse_slice_header(
         let _long_term_reference_flag = r.read_bit()?;
     }
 
+    // Parse weighted prediction table when applicable
+    // P-slices: type 0 or 5; B-slices: type 1 or 6
+    let is_p_slice = slice_type == 0 || slice_type == 5;
+    let is_b_slice = slice_type == 1 || slice_type == 6;
+    let weight_table = if (is_p_slice && pps.weighted_pred_flag)
+        || (is_b_slice && pps.weighted_bipred_idc == 1)
+    {
+        Some(parse_weight_table(
+            r,
+            slice_type,
+            pps.num_ref_idx_l0_default_active,
+            pps.num_ref_idx_l1_default_active,
+            sps.chroma_format_idc,
+        )?)
+    } else {
+        None
+    };
+
     let slice_qp_delta = r.read_se()?;
     let qp = pps.pic_init_qp + slice_qp_delta;
 
@@ -511,6 +692,7 @@ fn parse_slice_header(
         field_pic_flag,
         bottom_field_flag,
         qp,
+        weight_table,
     })
 }
 
@@ -894,6 +1076,265 @@ fn decode_macroblock(
             if chroma_cbp >= 2 {
                 if let Some(result) = decode_cavlc_on_reader(reader, 0) {
                     let coeffs_scan = super::cavlc::expand_cavlc_to_coefficients(&result, 16);
+                    let mut coeffs = [0i32; 16];
+                    unscan_4x4(&coeffs_scan, &mut coeffs);
+
+                    let chroma_qp = chroma_qp_from_luma_qp(qp);
+                    dequant_4x4(&mut coeffs, chroma_qp);
+                    inverse_dct_4x4(&mut coeffs);
+
+                    let dc_pred = compute_dc_prediction_chroma(plane, stride_uv, block_x, block_y);
+
+                    for r in 0..4 {
+                        for c in 0..4 {
+                            let residual = coeffs[r * 4 + c];
+                            let val = (dc_pred as i32 + residual).clamp(0, 255) as u8;
+                            let idx = (block_y + r) * stride_uv + block_x + c;
+                            if idx < plane.len() {
+                                plane[idx] = val;
+                            }
+                        }
+                    }
+                } else {
+                    let dc_pred = compute_dc_prediction_chroma(plane, stride_uv, block_x, block_y);
+                    write_dc_block_chroma(plane, stride_uv, block_x, block_y, dc_pred);
+                }
+            } else {
+                let dc_pred = compute_dc_prediction_chroma(plane, stride_uv, block_x, block_y);
+                write_dc_block_chroma(plane, stride_uv, block_x, block_y, dc_pred);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CABAC macroblock decoding
+// ---------------------------------------------------------------------------
+
+/// Decodes a single I-slice macroblock using CABAC entropy coding.
+///
+/// Mirrors `decode_macroblock` but uses CABAC for mb_type, coded_block_flag,
+/// and residual coefficient decoding instead of CAVLC/Exp-Golomb.
+#[allow(clippy::too_many_arguments)]
+fn decode_macroblock_cabac(
+    cabac: &mut CabacDecoder<'_>,
+    contexts: &mut Vec<CabacContext>,
+    qp: i32,
+    mb_x: usize,
+    mb_y: usize,
+    y_plane: &mut [u8],
+    u_plane: &mut [u8],
+    v_plane: &mut [u8],
+    stride_y: usize,
+    stride_uv: usize,
+) -> Result<(), VideoError> {
+    let mb_type = decode_mb_type_i_slice(cabac, contexts);
+
+    if mb_type == 25 {
+        // I_PCM: read raw samples via bypass bins
+        let px = mb_x * 16;
+        let py = mb_y * 16;
+        for row in 0..16 {
+            for col in 0..16 {
+                let val = h264_cabac::decode_fixed_length(cabac, 8) as u8;
+                let idx = (py + row) * stride_y + px + col;
+                if idx < y_plane.len() {
+                    y_plane[idx] = val;
+                }
+            }
+        }
+        let cpx = mb_x * 8;
+        let cpy = mb_y * 8;
+        for row in 0..8 {
+            for col in 0..8 {
+                let val = h264_cabac::decode_fixed_length(cabac, 8) as u8;
+                let idx = (cpy + row) * stride_uv + cpx + col;
+                if idx < u_plane.len() {
+                    u_plane[idx] = val;
+                }
+            }
+        }
+        for row in 0..8 {
+            for col in 0..8 {
+                let val = h264_cabac::decode_fixed_length(cabac, 8) as u8;
+                let idx = (cpy + row) * stride_uv + cpx + col;
+                if idx < v_plane.len() {
+                    v_plane[idx] = val;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let is_i16x16 = (1..=24).contains(&mb_type);
+    let is_i4x4 = mb_type == 0;
+
+    if is_i4x4 {
+        // Read intra4x4_pred_mode for each of the 16 4x4 blocks via CABAC
+        for _blk in 0..16 {
+            let prev_flag = cabac.decode_decision(&mut contexts[h264_cabac::ctx::MB_TYPE_I_START + 6]);
+            if !prev_flag {
+                // rem_intra4x4_pred_mode: 3 bits via bypass
+                let _rem_mode = h264_cabac::decode_fixed_length(cabac, 3);
+            }
+        }
+    }
+
+    // Chroma intra pred mode via CABAC (truncated unary, max 3)
+    let _chroma_pred_mode = h264_cabac::decode_truncated_unary(
+        cabac,
+        &mut contexts[h264_cabac::ctx::MB_TYPE_I_START + 7],
+        3,
+    );
+
+    // CBP for CABAC
+    let cbp = if is_i16x16 {
+        let cbp_luma = if (mb_type - 1) / 12 >= 1 { 15 } else { 0 };
+        let cbp_chroma = ((mb_type - 1) / 4) % 3;
+        cbp_luma | (cbp_chroma << 4)
+    } else {
+        // coded_block_pattern via CABAC: 4 luma bits + chroma bits
+        let mut cbp_val = 0u32;
+        for i in 0..4 {
+            if decode_coded_block_flag(cabac, contexts, i) {
+                cbp_val |= 1 << i;
+            }
+        }
+        // Chroma CBP: 0, 1, or 2
+        let chroma_cbp = h264_cabac::decode_truncated_unary(
+            cabac,
+            &mut contexts[h264_cabac::ctx::CODED_BLOCK_FLAG_LUMA + 4],
+            2,
+        );
+        cbp_val | (chroma_cbp << 4)
+    };
+
+    // QP delta via CABAC (Exp-Golomb bypass)
+    let qp = if cbp > 0 || is_i16x16 {
+        let qp_delta = h264_cabac::decode_exp_golomb_bypass(cabac, 0) as i32;
+        // Sign: even = positive, odd = negative (standard CABAC se mapping)
+        let qp_delta = if qp_delta & 1 == 0 {
+            qp_delta / 2
+        } else {
+            -(qp_delta as i32 + 1) / 2
+        };
+        (qp + qp_delta).rem_euclid(52)
+    } else {
+        qp
+    };
+
+    let px = mb_x * 16;
+    let py = mb_y * 16;
+
+    // Luma DC for I_16x16
+    let mut luma_dc = [0i32; 16];
+    if is_i16x16 {
+        let coeffs = decode_residual_block_cabac(cabac, contexts, 16);
+        unscan_4x4(&coeffs, &mut luma_dc);
+    }
+
+    let luma_block_offsets: [(usize, usize); 16] = [
+        (0, 0),
+        (0, 4),
+        (4, 0),
+        (4, 4),
+        (0, 8),
+        (0, 12),
+        (4, 8),
+        (4, 12),
+        (8, 0),
+        (8, 4),
+        (12, 0),
+        (12, 4),
+        (8, 8),
+        (8, 12),
+        (12, 8),
+        (12, 12),
+    ];
+
+    for blk_idx in 0..16 {
+        let cbp_group = blk_idx / 4;
+        if cbp & (1 << cbp_group) == 0 && !is_i16x16 {
+            let dc_val = compute_dc_prediction_luma(
+                y_plane,
+                stride_y,
+                px + luma_block_offsets[blk_idx].1,
+                py + luma_block_offsets[blk_idx].0,
+            );
+            write_dc_block_luma(
+                y_plane,
+                stride_y,
+                px + luma_block_offsets[blk_idx].1,
+                py + luma_block_offsets[blk_idx].0,
+                dc_val,
+            );
+            continue;
+        }
+
+        let mut coeffs = [0i32; 16];
+
+        if cbp & (1 << cbp_group) != 0 || is_i16x16 {
+            // Check coded_block_flag for this 4x4 block
+            let coded = decode_coded_block_flag(cabac, contexts, blk_idx % 4);
+            if coded {
+                let coeffs_scan = decode_residual_block_cabac(cabac, contexts, 16);
+                unscan_4x4(&coeffs_scan, &mut coeffs);
+            }
+        }
+
+        if is_i16x16 {
+            coeffs[0] = luma_dc[blk_idx];
+        }
+
+        dequant_4x4(&mut coeffs, qp);
+        inverse_dct_4x4(&mut coeffs);
+
+        let (boff_r, boff_c) = luma_block_offsets[blk_idx];
+        let block_x = px + boff_c;
+        let block_y = py + boff_r;
+        let dc_pred = compute_dc_prediction_luma(y_plane, stride_y, block_x, block_y);
+
+        for r in 0..4 {
+            for c in 0..4 {
+                let residual = coeffs[r * 4 + c];
+                let val = (dc_pred as i32 + residual).clamp(0, 255) as u8;
+                let idx = (block_y + r) * stride_y + block_x + c;
+                if idx < y_plane.len() {
+                    y_plane[idx] = val;
+                }
+            }
+        }
+    }
+
+    // Decode chroma blocks (4 Cb + 4 Cr)
+    let chroma_cbp = (cbp >> 4) & 3;
+    let cpx = mb_x * 8;
+    let cpy = mb_y * 8;
+    let chroma_block_offsets: [(usize, usize); 4] = [(0, 0), (0, 4), (4, 0), (4, 4)];
+
+    for plane_idx in 0..2 {
+        let plane = if plane_idx == 0 {
+            &mut *u_plane
+        } else {
+            &mut *v_plane
+        };
+
+        // Chroma DC
+        if chroma_cbp >= 1 {
+            let _dc_coeffs = decode_residual_block_cabac(cabac, contexts, 4);
+        }
+
+        for blk_idx in 0..4 {
+            let (boff_r, boff_c) = chroma_block_offsets[blk_idx];
+            let block_x = cpx + boff_c;
+            let block_y = cpy + boff_r;
+
+            if chroma_cbp >= 2 {
+                let coded = decode_coded_block_flag(cabac, contexts, blk_idx);
+                if coded {
+                    let coeffs_scan = decode_residual_block_cabac(cabac, contexts, 16);
                     let mut coeffs = [0i32; 16];
                     unscan_4x4(&coeffs_scan, &mut coeffs);
 
@@ -1434,28 +1875,71 @@ impl H264Decoder {
 
                 // Decode each macroblock; on any bitstream error, stop and
                 // return whatever has been decoded so far.
-                for mb_idx in 0..(mb_w * mb_h) {
-                    let mb_x = mb_idx % mb_w;
-                    let mb_y = mb_idx / mb_w;
-
-                    if reader.bits_remaining() < 8 {
-                        break;
+                if pps.entropy_coding_mode_flag {
+                    // CABAC mode: align to byte boundary and create CABAC decoder
+                    if reader.bit_offset != 0 {
+                        let skip = 8 - reader.bit_offset as usize;
+                        let _ = reader.skip_bits(skip);
                     }
+                    let cabac_data = &rbsp[reader.byte_offset..];
+                    let mut cabac = CabacDecoder::new(cabac_data);
+                    let mut contexts = init_cabac_contexts(slice_header.qp);
 
-                    if decode_macroblock(
-                        &mut reader,
-                        slice_header.qp,
-                        mb_x,
-                        mb_y,
-                        &mut y_plane,
-                        &mut u_plane,
-                        &mut v_plane,
-                        stride_y,
-                        stride_uv,
-                    )
-                    .is_err()
-                    {
-                        break;
+                    for mb_idx in 0..(mb_w * mb_h) {
+                        let mb_x = mb_idx % mb_w;
+                        let mb_y = mb_idx / mb_w;
+
+                        if cabac.bytes_remaining() < 1 {
+                            break;
+                        }
+
+                        // Check end_of_slice_flag before each macroblock (except first)
+                        if mb_idx > 0 && cabac.decode_terminate() {
+                            break;
+                        }
+
+                        if decode_macroblock_cabac(
+                            &mut cabac,
+                            &mut contexts,
+                            slice_header.qp,
+                            mb_x,
+                            mb_y,
+                            &mut y_plane,
+                            &mut u_plane,
+                            &mut v_plane,
+                            stride_y,
+                            stride_uv,
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                } else {
+                    // CAVLC mode (original path)
+                    for mb_idx in 0..(mb_w * mb_h) {
+                        let mb_x = mb_idx % mb_w;
+                        let mb_y = mb_idx / mb_w;
+
+                        if reader.bits_remaining() < 8 {
+                            break;
+                        }
+
+                        if decode_macroblock(
+                            &mut reader,
+                            slice_header.qp,
+                            mb_x,
+                            mb_y,
+                            &mut y_plane,
+                            &mut u_plane,
+                            &mut v_plane,
+                            stride_y,
+                            stride_uv,
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
 

@@ -1074,7 +1074,8 @@ pub fn decode_coding_tree_cabac(
             } else {
                 0
             };
-            recon[i] = (pred[i] as i32 + r).clamp(0, 255) as i16;
+            let max_val = (1i32 << sps.bit_depth_luma) - 1; // 255 for 8-bit, 1023 for 10-bit
+            recon[i] = (pred[i] as i32 + r).clamp(0, max_val) as i16;
         }
 
         // Write reconstructed samples back to the picture buffer

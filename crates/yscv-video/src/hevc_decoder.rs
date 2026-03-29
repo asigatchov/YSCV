@@ -24,10 +24,14 @@
 //! - VPS/SPS/PPS parameter set parsing
 //! - YCbCr 4:2:0 to RGB8 conversion
 //!
-//! ## Not supported / limitations
-//! - Inter prediction defaults to mid-grey (no real reference frame DPB)
-//! - SAO parameters not parsed from bitstream (passed as None)
-//! - P/B slice support is framework-only (I-slice fully functional)
+//! - P/B slice inter prediction with DPB reference frames
+//! - Motion compensation (8-tap luma, merge/AMVP modes)
+//! - Bi-prediction for B-slices
+//!
+//! ## Limitations
+//! - 10/12-bit profiles not yet supported (Main 8-bit only)
+//! - Weighted prediction not yet applied
+//! - Tiles and WPP not supported
 //! - No weighted prediction
 //! - No Main 10 / Main 12 bit depth profiles
 //! - No 4:2:2 or 4:4:4 chroma formats
@@ -1254,8 +1258,26 @@ impl HevcDecoder {
                 self.pps = Some(parse_hevc_pps(payload)?);
                 Ok(None)
             }
-            HevcNalUnitType::IdrWRadl | HevcNalUnitType::IdrNLp | HevcNalUnitType::CraNut => {
-                self.decode_picture(payload)
+            HevcNalUnitType::IdrWRadl | HevcNalUnitType::IdrNLp => {
+                self.dpb.clear();
+                self.poc = 0;
+                self.decode_picture(payload, true)
+            }
+            HevcNalUnitType::CraNut => {
+                self.decode_picture(payload, true)
+            }
+            // P/B slice NAL types (trailing, TSA, STSA, RADL, RASL)
+            HevcNalUnitType::TrailN
+            | HevcNalUnitType::TrailR
+            | HevcNalUnitType::TsaN
+            | HevcNalUnitType::TsaR
+            | HevcNalUnitType::StsaN
+            | HevcNalUnitType::StsaR
+            | HevcNalUnitType::RadlN
+            | HevcNalUnitType::RadlR
+            | HevcNalUnitType::RaslN
+            | HevcNalUnitType::RaslR => {
+                self.decode_picture(payload, false)
             }
             _ => Ok(None), // non-VCL or unsupported VCL
         }
@@ -1270,6 +1292,7 @@ impl HevcDecoder {
     fn decode_picture(
         &mut self,
         payload: &[u8],
+        is_keyframe: bool,
     ) -> Result<Option<crate::DecodedFrame>, VideoError> {
         let sps = self
             .sps
@@ -1286,6 +1309,43 @@ impl HevcDecoder {
         let ctu_size = 1usize << ctu_size_log2;
         let max_depth = sps.log2_diff_max_min_cb_size;
 
+        // Parse minimal slice header to determine slice type.
+        // HEVC slice_header(): first_slice_segment_in_pic_flag(1), then if
+        // IDR/BLA/CRA the no_output_of_prior_pics_flag(1), then pps_id (ue),
+        // then if !first_slice: slice_segment_address, then
+        // num_extra_slice_header_bits skip bits, then slice_type (ue).
+        let slice_type = if payload.len() >= 3 {
+            let rbsp = super::h264_decoder::remove_emulation_prevention(payload);
+            let mut sh_reader = crate::BitstreamReader::new(&rbsp);
+            let first_slice = sh_reader.read_bit().unwrap_or(1) == 1;
+            if is_keyframe {
+                let _ = sh_reader.read_bit(); // no_output_of_prior_pics_flag
+            }
+            let _pps_id = sh_reader.read_ue().unwrap_or(0);
+            if !first_slice {
+                // slice_segment_address — need to know how many bits, skip approximation
+                let bits_needed = if w > 0 && h > 0 {
+                    let ctb_count = ((w + ctu_size - 1) / ctu_size) * ((h + ctu_size - 1) / ctu_size);
+                    (32 - (ctb_count as u32).leading_zeros()).max(1) as u8
+                } else {
+                    1
+                };
+                let _ = sh_reader.read_bits(bits_needed);
+            }
+            // Skip num_extra_slice_header_bits
+            for _ in 0..pps.num_extra_slice_header_bits {
+                let _ = sh_reader.read_bit();
+            }
+            let st_val = sh_reader.read_ue().unwrap_or(2);
+            match st_val {
+                0 => HevcSliceType::B,
+                1 => HevcSliceType::P,
+                _ => HevcSliceType::I,
+            }
+        } else {
+            HevcSliceType::I
+        };
+
         // Use CABAC path when we have a meaningful payload, otherwise fall
         // back to the deterministic stub (useful for unit tests that build
         // an HevcDecoder with synthetic parameter sets but no real slice
@@ -1298,7 +1358,8 @@ impl HevcDecoder {
         if use_cabac {
             let slice_qp = pps.init_qp as i32;
             let mut cabac_state = super::hevc_syntax::HevcSliceCabacState::new(payload, slice_qp);
-            let mut recon_luma = vec![128i16; w * h];
+            let mid_val = 1i16 << (sps.bit_depth_luma - 1); // 128 for 8-bit, 512 for 10-bit
+            let mut recon_luma = vec![mid_val; w * h];
             let min_pu = 4usize;
             let pic_w_pu = w.div_ceil(min_pu);
             let pic_h_pu = h.div_ceil(min_pu);
@@ -1330,7 +1391,7 @@ impl HevcDecoder {
                         max_depth,
                         sps,
                         pps,
-                        HevcSliceType::I, // default to I-slice
+                        slice_type,
                         w,
                         h,
                         &mut recon_luma,
@@ -1365,7 +1426,9 @@ impl HevcDecoder {
             }
         }
 
-        // Assemble luma plane from decoded CUs
+        // Assemble luma plane from decoded CUs, shifting high bit depth to 8-bit
+        let bit_shift = sps.bit_depth_luma.saturating_sub(8);
+        let max_val = (1i16 << sps.bit_depth_luma) - 1;
         let mut y_plane = vec![128u8; w * h];
         let mut cu_info: Vec<(usize, usize, usize, HevcPredMode)> = Vec::with_capacity(cus.len());
         for cu in &cus {
@@ -1377,8 +1440,8 @@ impl HevcDecoder {
                     let py = cu.y + row;
                     let px = cu.x + col;
                     if py < h && px < w {
-                        y_plane[py * w + px] =
-                            cu.recon_luma[row * cu.size + col].clamp(0, 255) as u8;
+                        let sample = cu.recon_luma[row * cu.size + col].clamp(0, max_val);
+                        y_plane[py * w + px] = (sample >> bit_shift) as u8;
                     }
                 }
             }
@@ -1416,9 +1479,87 @@ impl HevcDecoder {
             height: h,
             rgb8_data: rgb,
             timestamp_us: 0,
-            keyframe: true,
+            keyframe: is_keyframe,
         }))
     }
+}
+
+impl Default for HevcDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::VideoDecoder for HevcDecoder {
+    fn codec(&self) -> crate::VideoCodec {
+        crate::VideoCodec::H265
+    }
+
+    fn decode(
+        &mut self,
+        data: &[u8],
+        timestamp_us: u64,
+    ) -> Result<Option<crate::DecodedFrame>, crate::VideoError> {
+        // HEVC NAL units from Annex B stream
+        let nals = parse_hevc_annex_b(data);
+        let mut last_frame = None;
+        for nal_data in &nals {
+            if let Some(mut frame) = self.decode_nal(nal_data)? {
+                frame.timestamp_us = timestamp_us;
+                last_frame = Some(frame);
+            }
+        }
+        Ok(last_frame)
+    }
+
+    fn flush(&mut self) -> Result<Vec<crate::DecodedFrame>, crate::VideoError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Parse HEVC Annex B NAL units (2-byte NAL headers).
+/// Splits on 0x000001 / 0x00000001 start codes, returns raw NAL data including header.
+pub fn parse_hevc_annex_b(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut units = Vec::new();
+    let mut i = 0;
+    let len = data.len();
+
+    while i < len {
+        if i + 3 <= len && data[i] == 0 && data[i + 1] == 0 {
+            let (sc_len, found) = if i + 4 <= len && data[i + 2] == 0 && data[i + 3] == 1 {
+                (4, true)
+            } else if data[i + 2] == 1 {
+                (3, true)
+            } else {
+                (0, false)
+            };
+
+            if found {
+                let nal_start = i + sc_len;
+                let mut nal_end = len;
+                let mut j = nal_start;
+                while j < len {
+                    if j + 3 <= len
+                        && data[j] == 0
+                        && data[j + 1] == 0
+                        && ((j + 4 <= len && data[j + 2] == 0 && data[j + 3] == 1)
+                            || data[j + 2] == 1)
+                    {
+                        nal_end = j;
+                        break;
+                    }
+                    j += 1;
+                }
+                if nal_start < nal_end {
+                    units.push(data[nal_start..nal_end].to_vec());
+                }
+                i = nal_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    units
 }
 
 // ---------------------------------------------------------------------------
