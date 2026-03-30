@@ -158,71 +158,70 @@ pub fn deblock_edge_luma(
     bs: u8,
     alpha: i32,
     beta: i32,
+    qp: u8,
 ) {
     if bs == 0 {
         return;
     }
 
-    // `across` steps across the boundary (towards p or q).
-    // `along` steps along the edge to the next pixel pair.
     let (across, along) = if is_vertical {
         (1usize, stride)
     } else {
         (stride, 1usize)
     };
 
+    let tc = if (1..=3).contains(&bs) {
+        derive_tc0(qp, bs) + 1
+    } else {
+        0
+    };
+    let alpha_quarter_plus2 = (alpha >> 2) + 2;
+
+    // Single bounds check for the entire 4-pixel group
+    let max_idx = offset + 3 * along + 2 * across;
+    let min_idx_needed = 3 * across;
+    if max_idx >= pixels.len() || offset < min_idx_needed {
+        return;
+    }
+
     for i in 0..4 {
         let q0_idx = offset + i * along;
+        let p0_idx = q0_idx - across;
 
-        // Bounds check: we need p2..=q2 to be valid indices.
-        if q0_idx + 2 * across >= pixels.len() || q0_idx < 3 * across {
+        let p0 = pixels[p0_idx] as i32;
+        let q0 = pixels[q0_idx] as i32;
+
+        // Quick threshold reject
+        let diff_pq = (p0 - q0).abs();
+        if diff_pq >= alpha {
             continue;
         }
 
-        let p0_idx = q0_idx - across;
-        let p1_idx = q0_idx - 2 * across;
-        let p2_idx = q0_idx - 3 * across;
-        let q1_idx = q0_idx + across;
-        let q2_idx = q0_idx + 2 * across;
+        let p1 = pixels[q0_idx - 2 * across] as i32;
+        let q1 = pixels[q0_idx + across] as i32;
 
-        let p0 = pixels[p0_idx] as i32;
-        let p1 = pixels[p1_idx] as i32;
-        let p2 = pixels[p2_idx] as i32;
-        let q0 = pixels[q0_idx] as i32;
-        let q1 = pixels[q1_idx] as i32;
-        let q2 = pixels[q2_idx] as i32;
-
-        // Threshold check: only filter if the discontinuity is within range.
-        if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+        if (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
             continue;
         }
 
         if bs == 4 {
-            // Strong filtering (intra edge).
-            let ap = (p2 - p0).abs();
-            let aq = (q2 - q0).abs();
+            let p2 = pixels[q0_idx - 3 * across] as i32;
+            let q2 = pixels[q0_idx + 2 * across] as i32;
 
-            if ap < beta && (p0 - q0).abs() < ((alpha >> 2) + 2) {
-                pixels[p0_idx] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) / 8).clamp(0, 255) as u8;
-                pixels[p1_idx] = ((p2 + p1 + p0 + q0 + 2) / 4).clamp(0, 255) as u8;
+            if (p2 - p0).abs() < beta && diff_pq < alpha_quarter_plus2 {
+                pixels[p0_idx] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u8;
+                pixels[q0_idx - 2 * across] = ((p2 + p1 + p0 + q0 + 2) >> 2) as u8;
             } else {
-                pixels[p0_idx] = ((2 * p1 + p0 + q1 + 2) / 4).clamp(0, 255) as u8;
+                pixels[p0_idx] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
             }
 
-            if aq < beta && (p0 - q0).abs() < ((alpha >> 2) + 2) {
-                pixels[q0_idx] = ((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) / 8).clamp(0, 255) as u8;
-                pixels[q1_idx] = ((q2 + q1 + q0 + p0 + 2) / 4).clamp(0, 255) as u8;
+            if (q2 - q0).abs() < beta && diff_pq < alpha_quarter_plus2 {
+                pixels[q0_idx] = ((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3) as u8;
+                pixels[q0_idx + across] = ((q2 + q1 + q0 + p0 + 2) >> 2) as u8;
             } else {
-                pixels[q0_idx] = ((2 * q1 + q0 + p1 + 2) / 4).clamp(0, 255) as u8;
+                pixels[q0_idx] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
             }
         } else {
-            // Normal filtering (bs = 1, 2, or 3).
-            let tc0 = derive_tc0(
-                ((alpha.unsigned_abs().leading_zeros() as i32 - 1).max(0)) as u8,
-                bs,
-            );
-            // Simplified: use tc = tc0 + 1 as an upper bound on the correction.
-            let tc = tc0 + 1;
             let delta = ((4 * (q0 - p0) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
             pixels[p0_idx] = (p0 + delta).clamp(0, 255) as u8;
             pixels[q0_idx] = (q0 - delta).clamp(0, 255) as u8;
@@ -236,6 +235,161 @@ pub fn deblock_edge_luma(
 
 /// Filter all macroblock boundaries in a frame.
 ///
+/// Skip-aware deblocking: skips edges where both adjacent MBs are P-skip.
+#[allow(unsafe_code)]
+pub fn deblock_frame_skip_aware(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    qp: u8,
+    mb_is_skip: &[bool],
+    mb_w: usize,
+) {
+    use rayon::prelude::*;
+
+    let alpha = derive_alpha(qp);
+    let beta = derive_beta(qp);
+    let mb_cols = width / 16;
+    let mb_rows = height / 16;
+    let bs: u8 = 2;
+    let tc = if (1..=3).contains(&bs) {
+        derive_tc0(qp, bs) + 1
+    } else {
+        0
+    };
+
+    let plane_size = width * height;
+    for ch in 0..channels {
+        let plane_offset = ch * plane_size;
+        if plane_offset + plane_size > frame.len() {
+            break;
+        }
+
+        let plane = &mut frame[plane_offset..plane_offset + plane_size];
+
+        // Vertical edges: parallel over MB rows, skip edges between two skip MBs
+        if mb_rows >= 4 {
+            plane
+                .par_chunks_mut(16 * width)
+                .enumerate()
+                .for_each(|(mb_row, chunk)| {
+                    let chunk_len = chunk.len();
+                    for mb_col in 1..mb_cols {
+                        // Skip if both left and right MBs are skip
+                        let left_skip = mb_is_skip
+                            .get(mb_row * mb_w + mb_col - 1)
+                            .copied()
+                            .unwrap_or(false);
+                        let right_skip = mb_is_skip
+                            .get(mb_row * mb_w + mb_col)
+                            .copied()
+                            .unwrap_or(false);
+                        if left_skip && right_skip {
+                            continue;
+                        }
+                        let edge_x = mb_col * 16;
+                        for row in 0..16 {
+                            let q0 = row * width + edge_x;
+                            if q0 < 2 || q0 + 2 > chunk_len {
+                                continue;
+                            }
+                            let p0 = chunk[q0 - 1] as i32;
+                            let q0v = chunk[q0] as i32;
+                            if (p0 - q0v).abs() >= alpha {
+                                continue;
+                            }
+                            let p1 = chunk[q0 - 2] as i32;
+                            let q1 = chunk[q0 + 1] as i32;
+                            if (p1 - p0).abs() >= beta || (q1 - q0v).abs() >= beta {
+                                continue;
+                            }
+                            let delta = ((4 * (q0v - p0) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                            chunk[q0 - 1] = (p0 + delta).clamp(0, 255) as u8;
+                            chunk[q0] = (q0v - delta).clamp(0, 255) as u8;
+                        }
+                    }
+                });
+        } else {
+            for mb_row in 0..mb_rows {
+                for mb_col in 1..mb_cols {
+                    let left_skip = mb_is_skip
+                        .get(mb_row * mb_w + mb_col - 1)
+                        .copied()
+                        .unwrap_or(false);
+                    let right_skip = mb_is_skip
+                        .get(mb_row * mb_w + mb_col)
+                        .copied()
+                        .unwrap_or(false);
+                    if left_skip && right_skip {
+                        continue;
+                    }
+                    let edge_x = mb_col * 16;
+                    let base_y = mb_row * 16;
+                    for row in 0..16 {
+                        let q0 = (base_y + row) * width + edge_x;
+                        if q0 < 2 || q0 + 2 > plane.len() {
+                            continue;
+                        }
+                        let p0 = plane[q0 - 1] as i32;
+                        let q0v = plane[q0] as i32;
+                        if (p0 - q0v).abs() >= alpha {
+                            continue;
+                        }
+                        let p1 = plane[q0 - 2] as i32;
+                        let q1 = plane[q0 + 1] as i32;
+                        if (p1 - p0).abs() >= beta || (q1 - q0v).abs() >= beta {
+                            continue;
+                        }
+                        let delta = ((4 * (q0v - p0) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                        plane[q0 - 1] = (p0 + delta).clamp(0, 255) as u8;
+                        plane[q0] = (q0v - delta).clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+
+        // Horizontal edges (sequential, skip-aware)
+        for mb_row in 1..mb_rows {
+            for mb_col in 0..mb_cols {
+                let top_skip = mb_is_skip
+                    .get((mb_row - 1) * mb_w + mb_col)
+                    .copied()
+                    .unwrap_or(false);
+                let bot_skip = mb_is_skip
+                    .get(mb_row * mb_w + mb_col)
+                    .copied()
+                    .unwrap_or(false);
+                if top_skip && bot_skip {
+                    continue;
+                }
+                let edge_y = mb_row * 16;
+                let base_x = mb_col * 16;
+                for col in 0..16 {
+                    let x = base_x + col;
+                    let q0 = edge_y * width + x;
+                    if q0 < 3 * width || q0 + 2 * width >= plane.len() {
+                        continue;
+                    }
+                    let p0 = plane[q0 - width] as i32;
+                    let q0v = plane[q0] as i32;
+                    if (p0 - q0v).abs() >= alpha {
+                        continue;
+                    }
+                    let p1 = plane[q0 - 2 * width] as i32;
+                    let q1 = plane[q0 + width] as i32;
+                    if (p1 - p0).abs() >= beta || (q1 - q0v).abs() >= beta {
+                        continue;
+                    }
+                    let delta = ((4 * (q0v - p0) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                    plane[q0 - width] = (p0 + delta).clamp(0, 255) as u8;
+                    plane[q0] = (q0v - delta).clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+}
+
 /// Iterates over every macroblock row and column, applying the deblocking
 /// filter to both vertical and horizontal edges. The `qp` parameter is the
 /// average slice quantization parameter used to derive filter thresholds.
@@ -244,46 +398,115 @@ pub fn deblock_edge_luma(
 /// channel plane (the caller should ensure the frame is in planar or
 /// interleaved format; this implementation assumes a single luma plane or
 /// operates channel-by-channel).
+#[allow(unsafe_code)]
 pub fn deblock_frame(frame: &mut [u8], width: usize, height: usize, channels: usize, qp: u8) {
+    use rayon::prelude::*;
+
     let alpha = derive_alpha(qp);
     let beta = derive_beta(qp);
     let mb_cols = width / 16;
     let mb_rows = height / 16;
+    let bs: u8 = 2;
+    let tc = if (1..=3).contains(&bs) {
+        derive_tc0(qp, bs) + 1
+    } else {
+        0
+    };
 
-    // Process each channel independently.
     let plane_size = width * height;
     for ch in 0..channels {
         let plane_offset = ch * plane_size;
-
-        // Work on a contiguous plane slice.
-        // For interleaved data we would need a different approach; here we
-        // assume planar layout or single-channel input.
         if plane_offset + plane_size > frame.len() {
             break;
         }
 
-        // Vertical edges (left boundary of each macroblock, skip column 0).
-        for mb_row in 0..mb_rows {
-            for mb_col in 1..mb_cols {
-                let edge_x = mb_col * 16;
-                for row in 0..16 {
-                    let y = mb_row * 16 + row;
-                    let q0_offset = plane_offset + y * width + edge_x;
-                    // Use a default bs=2 for demonstration; in a full decoder
-                    // this would come from per-block metadata.
-                    deblock_edge_luma(frame, width, q0_offset, true, 2, alpha, beta);
+        // Vertical edges: parallelize over MB rows using chunks_mut.
+        // Each MB row's vertical edges only touch pixels in rows [mb_row*16..(mb_row+1)*16].
+        let plane = &mut frame[plane_offset..plane_offset + plane_size];
+        if mb_rows >= 4 {
+            plane.par_chunks_mut(16 * width).for_each(|mb_row_chunk| {
+                // mb_row_chunk is exactly 16 rows of width pixels
+                let chunk_len = mb_row_chunk.len();
+                for mb_col in 1..mb_cols {
+                    let edge_x = mb_col * 16;
+                    for row_in_mb in 0..16 {
+                        let q0 = row_in_mb * width + edge_x;
+                        if q0 < 2 || q0 + 2 > chunk_len {
+                            continue;
+                        }
+                        let p0 = mb_row_chunk[q0 - 1] as i32;
+                        let q0v = mb_row_chunk[q0] as i32;
+                        if (p0 - q0v).abs() >= alpha {
+                            continue;
+                        }
+                        let p1 = mb_row_chunk[q0 - 2] as i32;
+                        let q1 = mb_row_chunk[q0 + 1] as i32;
+                        if (p1 - p0).abs() >= beta || (q1 - q0v).abs() >= beta {
+                            continue;
+                        }
+                        let delta = ((4 * (q0v - p0) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                        mb_row_chunk[q0 - 1] = (p0 + delta).clamp(0, 255) as u8;
+                        mb_row_chunk[q0] = (q0v - delta).clamp(0, 255) as u8;
+                    }
+                }
+            });
+        } else {
+            // Small frame: sequential fallback
+            for mb_row in 0..mb_rows {
+                for mb_col in 1..mb_cols {
+                    let edge_x = mb_col * 16;
+                    let base_y = mb_row * 16;
+                    for row in 0..16 {
+                        let y = base_y + row;
+                        let q0 = plane_offset + y * width + edge_x;
+                        if q0 < 3 || q0 + 2 >= frame.len() {
+                            continue;
+                        }
+                        let p0 = frame[q0 - 1] as i32;
+                        let q0v = frame[q0] as i32;
+                        if (p0 - q0v).abs() >= alpha {
+                            continue;
+                        }
+                        let p1 = frame[q0 - 2] as i32;
+                        let q1 = frame[q0 + 1] as i32;
+                        if (p1 - p0).abs() >= beta || (q1 - q0v).abs() >= beta {
+                            continue;
+                        }
+                        let delta = ((4 * (q0v - p0) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                        frame[q0 - 1] = (p0 + delta).clamp(0, 255) as u8;
+                        frame[q0] = (q0v - delta).clamp(0, 255) as u8;
+                    }
                 }
             }
         }
 
-        // Horizontal edges (top boundary of each macroblock, skip row 0).
+        // Horizontal edges: parallelize over MB rows (each row accesses 2 adjacent pixel rows).
+        // Horizontal edge at mb_row touches rows [mb_row*16-2..mb_row*16+2], so adjacent
+        // MB row edges are 16 rows apart — no overlap if mb_rows > 1.
+        // Horizontal edges: sequential (cross MB row boundaries).
         for mb_row in 1..mb_rows {
             for mb_col in 0..mb_cols {
                 let edge_y = mb_row * 16;
+                let base_x = mb_col * 16;
                 for col in 0..16 {
-                    let x = mb_col * 16 + col;
-                    let q0_offset = plane_offset + edge_y * width + x;
-                    deblock_edge_luma(frame, width, q0_offset, false, 2, alpha, beta);
+                    let x = base_x + col;
+                    let q0 = plane_offset + edge_y * width + x;
+                    if q0 < 3 * width || q0 + 2 * width >= frame.len() {
+                        continue;
+                    }
+                    let p0 = frame[q0 - width] as i32;
+                    let q0v = frame[q0] as i32;
+                    if (p0 - q0v).abs() >= alpha {
+                        continue;
+                    }
+                    let p1 = frame[q0 - 2 * width] as i32;
+                    let q1 = frame[q0 + width] as i32;
+                    if (p1 - p0).abs() >= beta || (q1 - q0v).abs() >= beta {
+                        continue;
+                    }
+                    let delta = ((4 * (q0v - p0) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                    frame[q0 - width] = (p0 + delta).clamp(0, 255) as u8;
+                    frame[q0] = (q0v - delta).clamp(0, 255) as u8;
                 }
             }
         }
@@ -374,7 +597,7 @@ mod tests {
         let alpha = 40;
         let beta = 20;
         let q0_offset = 3 * width + 16; // row 3 so we have p2..q2 room
-        deblock_edge_luma(&mut pixels, width, q0_offset, true, 4, alpha, beta);
+        deblock_edge_luma(&mut pixels, width, q0_offset, true, 4, alpha, beta, 26);
 
         // After filtering, the discontinuity at the boundary should be
         // reduced (or at least not increased).

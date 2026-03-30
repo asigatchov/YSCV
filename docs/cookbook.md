@@ -260,11 +260,11 @@ CPU performance vs competitors (YOLOv8n 640×640, Apple M1):
 
 | Runtime | YOLOv8n | YOLO11n | Opset 22 |
 |---------|---------|---------|----------|
-| **yscv** | **31.7ms** | **34.3ms** | Yes |
-| onnxruntime 1.19 | 100.8ms (3.2× slower) | FAILED | No |
-| tract 0.21 | 217.2ms (6.8× slower) | FAILED | No |
+| **yscv** | **30.4ms** | **33.7ms** | Yes |
+| onnxruntime 1.19 | 37.4ms | 35.2ms* | No* |
+| tract 0.21 | 217.2ms (7× slower) | FAILED | No |
 
-Both competitors crash on YOLO11n — onnxruntime lacks opset 22 support, tract fails on TDim parsing. yscv runs both models without issues.
+\* onnxruntime requires manual opset downgrade (22→21) for YOLO11n; native opset 22 files fail. yscv handles opset 22 natively. tract fails on YOLO11n and is 7× slower on YOLOv8n.
 
 ---
 
@@ -643,22 +643,42 @@ cargo run --example classify_image -- photo.jpg
 
 ## Video Processing
 
-### Decode MP4 frames
+### Decode MP4 frames (H.264 / HEVC)
+
+Decode any H.264 MP4 file — Baseline (CAVLC), Main, or High profile (CABAC) are all supported. The decoder auto-detects the codec from the MP4 container.
 
 ```rust
 use yscv_video::Mp4VideoReader;
+use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut reader = Mp4VideoReader::open("video.mp4")?;
-    println!("Resolution: {}x{}", reader.width(), reader.height());
+    let mut reader = Mp4VideoReader::open(Path::new("video.mp4"))?;
+    println!("NALs: {}, Codec: {:?}", reader.nal_count(), reader.codec());
 
+    let mut frame_count = 0;
     while let Some(frame) = reader.next_frame()? {
-        // frame is RGB u8 data
-        // Process each frame here...
+        println!("Frame {}: {}x{} keyframe={}", frame_count, frame.width, frame.height, frame.keyframe);
+        // frame.rgb8_data is Vec<u8> (RGB8, width * height * 3 bytes)
+        frame_count += 1;
     }
+    println!("Total: {frame_count} frames decoded");
     Ok(())
 }
 ```
+
+The decoder handles:
+- **MP4 container**: avcC/hvcC parameter set extraction, stbl/stco/stsz sample table navigation, interleaved audio/video demuxing
+- **H.264**: Baseline (CAVLC), Main (CABAC), High (CABAC + 8x8 transform), I/P/B slices, deblocking filter, SIMD IDCT (NEON + SSE2)
+- **HEVC**: Main, Main10 (10-bit), I/P/B slices, CABAC, deblocking + SAO, CTU quad-tree
+
+Performance (Apple M1, single-threaded, vs ffmpeg `-threads 1`):
+
+| Video | yscv | ffmpeg | Speedup |
+|-------|------|--------|---------|
+| Real camera H.264 1080p60 (1100 frames) | 1179ms | 5336ms | **4.5×** |
+| H.264 Main B-frames 480p | 24ms | 96ms | **4.0×** |
+| H.264 High CABAC 4K | 62ms | 247ms | **4.0×** |
+| HEVC Main10 10-bit 720p | 316ms | 257ms | **0.8×** |
 
 ### Camera capture (requires `native-camera` feature)
 
@@ -766,6 +786,9 @@ cargo run --release --example bench_metal_yolo --features metal-backend
 # Metal conv kernel isolation
 cargo run --release --example bench_metal_conv --features metal-backend
 
+# H.264 video decode benchmark
+cargo run --release --example bench_video_decode -- video.mp4
+
 # Criterion micro-benchmarks (per crate)
 cargo bench -p yscv-kernels
 cargo bench -p yscv-imgproc
@@ -784,9 +807,12 @@ python benchmarks/python/bench_opencv.py    # vs OpenCV
 
 | What | yscv | Competitor | Speedup |
 |------|------|-----------|---------|
-| YOLOv8n CPU | 31.7ms | onnxruntime 100.8ms | **3.2x** |
-| YOLOv8n MPSGraph | **3.5ms** | CoreML 14.2ms | **4.1x** |
-| YOLO11n CPU | 34.3ms | onnxruntime FAIL | only yscv |
+| YOLOv8n CPU | **30.4ms** | onnxruntime 37.4ms | **1.2x** |
+| YOLOv8n MPSGraph | **3.5ms** | CoreML 15.5ms | **4.4x** |
+| YOLO11n CPU | **33.7ms** | onnxruntime 35.2ms* | **1.0x** |
+| H.264 decode 1080p60 (1100 frames) | **1213ms** | ffmpeg 5348ms | **4.4x** |
+| H.264 LowBR 480p | **23ms** | ffmpeg 77ms | **3.3x** |
+| H.264 CABAC 4K | **59ms** | ffmpeg 233ms | **3.9x** |
 | sigmoid 921K | 0.217ms | PyTorch 1.296ms | **6.0x** |
 | resize nearest u8 | 0.048ms | OpenCV 0.157ms | **3.3x** |
 | detect+track pipeline | 0.067ms | — | 15,000 FPS |

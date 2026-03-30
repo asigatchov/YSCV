@@ -278,7 +278,10 @@ pub fn hevc_mc_luma(
     // First filter horizontally into a temporary buffer (with extra rows for
     // the vertical filter tap extent), then filter vertically.
     let ext_h = block_h + 7; // 3 rows above + 4 rows below
-    let mut tmp = vec![0i32; ext_h * block_w];
+    // Stack buffer: max 71*64 = 4544 i32 = 18KB (safe for stack, not in recursion)
+    let tmp_size = ext_h * block_w;
+    let mut tmp_buf = [0i32; 71 * 64];
+    let tmp = &mut tmp_buf[..tmp_size];
 
     // Horizontal pass: produce (block_h + 7) rows of block_w intermediate
     // samples shifted by 6 bits.

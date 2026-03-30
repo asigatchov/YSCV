@@ -13,6 +13,9 @@ Thumbs.db
 *.swo
 *~
 
+# Video test files
+examples/src/*.mp4
+
 # AI agent workspace
 .claude/worktrees/
 .claude/settings.local.json

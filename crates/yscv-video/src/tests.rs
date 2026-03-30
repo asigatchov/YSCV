@@ -540,6 +540,130 @@ fn mp4_box_parse_basic() {
 }
 
 #[test]
+fn extract_avcc_nals_parses_sps_pps() {
+    // Build a synthetic moov chunk containing an avcC box
+    let mut moov = Vec::new();
+
+    // Some padding (like other boxes before avcC)
+    moov.extend_from_slice(&[0x00; 20]);
+
+    // "avcC" tag
+    moov.extend_from_slice(b"avcC");
+
+    // avcC config: version(1) + profile(66=baseline) + compat(0xC0) + level(30) + lengthSizeMinusOne(0xFF = 3+0xFC)
+    moov.push(1); // configurationVersion
+    moov.push(66); // AVCProfileIndication (Baseline)
+    moov.push(0xC0); // profile_compatibility
+    moov.push(30); // AVCLevelIndication (3.0)
+    moov.push(0xFF); // lengthSizeMinusOne = 3 (lower 2 bits) + reserved bits
+
+    // numSPS = 1 (lower 5 bits of 0xE1 = 1)
+    moov.push(0xE1);
+
+    // SPS: length=4, data=[0x67, 0x42, 0xC0, 0x1E] (typical SPS NAL header 0x67 = nal_type=7 SPS)
+    let sps_data = [0x67, 0x42, 0xC0, 0x1E];
+    moov.extend_from_slice(&(sps_data.len() as u16).to_be_bytes());
+    moov.extend_from_slice(&sps_data);
+
+    // numPPS = 1
+    moov.push(1);
+
+    // PPS: length=3, data=[0x68, 0xCE, 0x38] (typical PPS NAL header 0x68 = nal_type=8 PPS)
+    let pps_data = [0x68, 0xCE, 0x38];
+    moov.extend_from_slice(&(pps_data.len() as u16).to_be_bytes());
+    moov.extend_from_slice(&pps_data);
+
+    let nals = super::video_io::extract_avcc_nals(&moov);
+    assert_eq!(nals.len(), 2, "should extract 1 SPS + 1 PPS");
+
+    assert_eq!(nals[0].nal_type, super::codec::NalUnitType::Sps);
+    assert_eq!(nals[0].data, sps_data);
+
+    assert_eq!(nals[1].nal_type, super::codec::NalUnitType::Pps);
+    assert_eq!(nals[1].data, pps_data);
+}
+
+#[test]
+fn extract_avcc_nals_empty_on_no_avcc() {
+    let moov = vec![0x00; 100]; // no avcC tag
+    let nals = super::video_io::extract_avcc_nals(&moov);
+    assert!(nals.is_empty());
+}
+
+#[test]
+fn mp4_h264_decode_real_file() {
+    // Integration test: decode a real H.264 MP4 if the test file exists
+    let path = std::path::Path::new("/tmp/test_h264.mp4");
+    if !path.exists() {
+        // Skip test if file not present (created by ffmpeg in dev environment)
+        return;
+    }
+    let mut reader =
+        super::video_io::Mp4VideoReader::open(path).expect("should open H.264 MP4 without error");
+    let nal_count = reader.nal_count();
+    assert!(nal_count > 0, "should find NAL units, got 0");
+
+    // Try to decode frames, collecting results
+    let mut frames = Vec::new();
+    let mut errors = Vec::new();
+    for _ in 0..nal_count {
+        match reader.next_frame() {
+            Ok(Some(f)) => frames.push(f),
+            Ok(None) => break,
+            Err(e) => errors.push(format!("{e}")),
+        }
+    }
+
+    // Debug: check what NAL types we got
+    reader.seek_start();
+    // We can't inspect NAL types directly but we know: 3 NALs = SPS + PPS + 1 video NAL
+    // If no frames decoded, the video NAL is probably non-IDR Slice type
+
+    assert!(
+        !frames.is_empty(),
+        "should decode at least one frame from {nal_count} NALs. Errors: {errors:?}"
+    );
+    let frame = &frames[0];
+
+    assert!(frame.width > 0 && frame.height > 0, "valid dimensions");
+    assert_eq!(frame.rgb8_data.len(), frame.width * frame.height * 3);
+
+    // Verify it's not all-gray (which would mean decode failure)
+    let min = frame.rgb8_data.iter().copied().min().unwrap_or(0);
+    let max = frame.rgb8_data.iter().copied().max().unwrap_or(0);
+    assert!(
+        max > min,
+        "frame should not be uniform gray — actual min={min} max={max}"
+    );
+}
+
+#[test]
+fn mp4_h264_high_profile_decode() {
+    // Test H.264 High profile (CABAC) MP4
+    let path = std::path::Path::new("/tmp/test_h264_high.mp4");
+    if !path.exists() {
+        return;
+    }
+    let mut reader =
+        super::video_io::Mp4VideoReader::open(path).expect("should open H.264 High profile MP4");
+    assert!(reader.nal_count() > 0);
+
+    match reader.next_frame() {
+        Ok(Some(frame)) => {
+            assert!(frame.width > 0 && frame.height > 0);
+            let min = frame.rgb8_data.iter().copied().min().unwrap_or(0);
+            let max = frame.rgb8_data.iter().copied().max().unwrap_or(0);
+            assert!(
+                max > min,
+                "CABAC frame should not be uniform — min={min} max={max}"
+            );
+        }
+        Ok(None) => panic!("no frame decoded from High profile MP4"),
+        Err(e) => panic!("decode error: {e}"),
+    }
+}
+
+#[test]
 fn video_codec_enum_basics() {
     use super::codec::VideoCodec;
     assert_eq!(VideoCodec::H264, VideoCodec::H264);

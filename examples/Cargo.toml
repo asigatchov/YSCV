@@ -109,5 +109,9 @@ name = "yolo_vis"
 path = "src/yolo_vis.rs"
 required-features = ["metal-backend"]
 
+[[example]]
+name = "bench_video_decode"
+path = "src/bench_video_decode.rs"
+
 [lints]
 workspace = true

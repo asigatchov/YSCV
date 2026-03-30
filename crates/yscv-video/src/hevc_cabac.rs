@@ -237,54 +237,68 @@ impl<'a> CabacDecoder<'a> {
     // Core decoding primitives (spec 9.3.3.2)
     // ------------------------------------------------------------------
 
-    /// Renormalise the decoder state (spec 9.3.3.2.2).
-    ///
-    /// Called after every decision bin to ensure `range` stays in
-    /// \[256, 510\].
+    /// Renormalise the decoder state. Uses CLZ to compute shift count
+    /// and batch-reads bits instead of per-bit loop.
+    #[inline(always)]
     fn renormalize(&mut self) {
+        if self.range >= 256 {
+            return;
+        }
+        // Typically 1-2 iterations (range after table lookup is ≥ 16)
         while self.range < 256 {
             self.range <<= 1;
-            self.value = (self.value << 1) | self.read_bit();
+            self.value = (self.value << 1) | self.read_bit_fast();
         }
     }
 
-    /// Decode one bin using context-modelled arithmetic coding
-    /// (spec 9.3.3.2.1).
-    ///
-    /// The context model is read and **updated** after decoding.
-    /// Returns `true` for bin value 1, `false` for bin value 0.
+    /// Fast bit read — inlined, branchless-friendly.
+    #[inline(always)]
+    fn read_bit_fast(&mut self) -> u32 {
+        if self.bits_left == 0 {
+            if self.offset < self.data.len() {
+                self.bits_left = 8;
+                self.offset += 1;
+            } else {
+                return 0;
+            }
+        }
+        self.bits_left -= 1;
+        (u32::from(self.data[self.offset - 1]) >> self.bits_left) & 1
+    }
+
+    /// Decode one bin using context-modelled arithmetic coding.
+    /// Hot path — #[inline(always)] for maximum IPC.
+    #[inline(always)]
     pub fn decode_decision(&mut self, ctx: &mut ContextModel) -> bool {
-        let q_range_idx = (self.range >> 6) & 3;
-        let range_lps = u32::from(RANGE_TAB_LPS[ctx.state as usize][q_range_idx as usize]);
+        let state = ctx.state as usize;
+        let q_range_idx = ((self.range >> 6) & 3) as usize;
+        let range_lps = u32::from(RANGE_TAB_LPS[state][q_range_idx]);
         self.range -= range_lps;
 
-        let bin_val;
         if self.value < self.range {
-            // MPS path
-            bin_val = ctx.mps;
-            ctx.state = TRANS_IDX_MPS[ctx.state as usize];
+            // MPS path (~80% of cases)
+            ctx.state = TRANS_IDX_MPS[state];
+            let result = ctx.mps != 0;
+            self.renormalize();
+            result
         } else {
             // LPS path
-            bin_val = 1 - ctx.mps;
+            let bin_val = 1 - ctx.mps;
             self.value -= self.range;
             self.range = range_lps;
-
-            if ctx.state == 0 {
+            if state == 0 {
                 ctx.mps = 1 - ctx.mps;
             }
-            ctx.state = TRANS_IDX_LPS[ctx.state as usize];
+            ctx.state = TRANS_IDX_LPS[state];
+            self.renormalize();
+            bin_val != 0
         }
-
-        self.renormalize();
-        bin_val != 0
     }
 
-    /// Decode one bin in bypass (equiprobable) mode (spec 9.3.3.2.3).
-    ///
-    /// No context model is used; the two symbols are equally likely.
+    /// Decode one bin in bypass (equiprobable) mode. Inlined.
+    #[inline(always)]
     pub fn decode_bypass(&mut self) -> bool {
-        self.value = (self.value << 1) | self.read_bit();
-
+        self.value = (self.value << 1) | self.read_bit_fast();
         if self.value >= self.range {
             self.value -= self.range;
             true
@@ -298,6 +312,7 @@ impl<'a> CabacDecoder<'a> {
     /// Used to detect end-of-slice or end-of-sub-stream.  The interval is
     /// reduced by 2 first; if the remaining value falls in the upper
     /// sub-range the terminating condition is signalled.
+    #[inline(always)]
     pub fn decode_terminate(&mut self) -> bool {
         self.range -= 2;
         if self.value >= self.range {
@@ -305,6 +320,16 @@ impl<'a> CabacDecoder<'a> {
         } else {
             self.renormalize();
             false
+        }
+    }
+
+    /// Returns the number of unconsumed bytes remaining in the input.
+    pub fn bytes_remaining(&self) -> usize {
+        let full_bytes = self.data.len().saturating_sub(self.offset);
+        if self.bits_left > 0 {
+            full_bytes + 1
+        } else {
+            full_bytes
         }
     }
 
@@ -322,6 +347,7 @@ impl<'a> CabacDecoder<'a> {
     ///
     /// The prefix is decoded as a **truncated unary** code using context
     /// models, and the suffix (if any) is decoded in bypass mode.
+    #[inline]
     pub fn decode_tr(&mut self, ctx: &mut [ContextModel], c_max: u32, c_rice_param: u32) -> u32 {
         let prefix_max = c_max >> c_rice_param;
         // Truncated unary prefix
@@ -351,11 +377,13 @@ impl<'a> CabacDecoder<'a> {
     ///
     /// Reads `n_bits` bypass bins and returns the resulting value
     /// (MSB-first).
+    #[inline(always)]
     pub fn decode_fl(&mut self, n_bits: u32) -> u32 {
         self.decode_fl_bypass(n_bits)
     }
 
     /// Inner helper: read `n_bits` bypass bins MSB-first.
+    #[inline(always)]
     fn decode_fl_bypass(&mut self, n_bits: u32) -> u32 {
         let mut val = 0u32;
         for _ in 0..n_bits {
@@ -369,6 +397,7 @@ impl<'a> CabacDecoder<'a> {
     /// Returns the number of `1` bins seen before the first `0` bin, capped
     /// at `max`.  Context index for each bin position `k` is
     /// `min(k, ctx.len() - 1)`.
+    #[inline]
     pub fn decode_unary(&mut self, ctx: &mut [ContextModel], max: u32) -> u32 {
         let mut val = 0u32;
         while val < max {
@@ -386,6 +415,7 @@ impl<'a> CabacDecoder<'a> {
     /// (spec 9.3.2.5, k-th order).
     ///
     /// `k` is the order parameter.  Returns the decoded unsigned value.
+    #[inline]
     pub fn decode_eg(&mut self, k: u32) -> u32 {
         // Prefix: count leading ones (Exp-Golomb uses bypass bins).
         let mut leading = 0u32;

@@ -10,6 +10,8 @@ mod convert;
 mod error;
 #[path = "frame.rs"]
 mod frame;
+#[path = "h264_bitstream.rs"]
+pub mod h264_bitstream;
 #[path = "h264_bslice.rs"]
 pub mod h264_bslice;
 #[path = "h264_cabac.rs"]
@@ -20,6 +22,12 @@ pub mod h264_deblock;
 mod h264_decoder;
 #[path = "h264_motion.rs"]
 pub mod h264_motion;
+#[path = "h264_params.rs"]
+pub mod h264_params;
+#[path = "h264_transform.rs"]
+pub mod h264_transform;
+#[path = "h264_yuv.rs"]
+pub mod h264_yuv;
 #[path = "hevc_cabac.rs"]
 pub mod hevc_cabac;
 #[path = "hevc_decoder.rs"]
@@ -28,8 +36,12 @@ pub mod hevc_decoder;
 pub mod hevc_filter;
 #[path = "hevc_inter.rs"]
 pub mod hevc_inter;
+#[path = "hevc_params.rs"]
+pub mod hevc_params;
 #[path = "hevc_syntax.rs"]
 pub mod hevc_syntax;
+#[path = "hevc_transform.rs"]
+pub mod hevc_transform;
 #[path = "source.rs"]
 mod source;
 #[path = "stream.rs"]
@@ -55,6 +67,7 @@ pub use codec::{
 pub use convert::normalize_rgb8_to_f32_inplace;
 pub use error::VideoError;
 pub use frame::{Frame, PixelFormat, Rgb8Frame};
+pub use h264_bitstream::BitstreamReader;
 pub use h264_bslice::{BPredMode, BiMotionVector, decode_b_macroblock, motion_compensate_bipred};
 pub use h264_cabac::{
     CabacContext, CabacDecoder as H264CabacDecoder, EntropyCodingMode,
@@ -63,12 +76,13 @@ pub use h264_cabac::{
     decode_residual_block_cabac, decode_truncated_unary, decode_unary, init_cabac_contexts,
 };
 pub use h264_deblock::{compute_boundary_strength, deblock_edge_luma, deblock_frame};
-pub use h264_decoder::{
-    BitstreamReader, H264Decoder, HevcNalUnitType, Pps, SliceHeader, Sps, dequant_4x4,
-    inverse_dct_4x4, parse_pps, parse_sps, yuv420_to_rgb8,
-};
+pub use h264_decoder::H264Decoder;
 pub use h264_motion::{MotionVector, ReferenceFrameBuffer, motion_compensate_16x16, predict_mv};
+pub use h264_params::{Pps, SliceHeader, Sps, parse_pps, parse_sps};
+pub use h264_transform::{dequant_4x4, inverse_dct_4x4};
+pub use h264_yuv::yuv420_to_rgb8;
 pub use hevc_cabac::{CabacDecoder, ContextModel};
+pub use hevc_decoder::HevcNalUnitType;
 pub use hevc_decoder::{
     CodingTreeUnit, DecodedCu, HevcDecoder, HevcIntraMode, HevcPps, HevcPredMode, HevcSliceHeader,
     HevcSliceType, HevcSps, HevcVps, decode_coding_tree, hevc_dequant, hevc_frame_dimensions,

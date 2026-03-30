@@ -58,12 +58,30 @@ pub fn motion_compensate_16x16(
 ) {
     let src_x = (mb_x * 16) as i32 + mv.dx as i32;
     let src_y = (mb_y * 16) as i32 + mv.dy as i32;
+    let ref_w = ref_width as i32;
+    let ref_h = ref_height as i32;
 
+    // Fast path for single-channel (luma) when entire block is in-bounds
+    if channels == 1 && src_x >= 0 && src_x + 16 <= ref_w && src_y >= 0 && src_y + 16 <= ref_h {
+        let sx = src_x as usize;
+        let sy = src_y as usize;
+        for row in 0..16 {
+            let dst_start = (mb_y * 16 + row) * out_width + mb_x * 16;
+            let src_start = (sy + row) * ref_width + sx;
+            if dst_start + 16 <= output.len() && src_start + 16 <= reference.len() {
+                output[dst_start..dst_start + 16]
+                    .copy_from_slice(&reference[src_start..src_start + 16]);
+            }
+        }
+        return;
+    }
+
+    // Slow path: per-pixel with clamping (handles edge cases + multi-channel)
     for row in 0..16 {
+        let sy = (src_y + row as i32).clamp(0, ref_h - 1) as usize;
+        let dst_y = mb_y * 16 + row;
         for col in 0..16 {
-            let sy = (src_y + row as i32).clamp(0, ref_height as i32 - 1) as usize;
-            let sx = (src_x + col as i32).clamp(0, ref_width as i32 - 1) as usize;
-            let dst_y = mb_y * 16 + row;
+            let sx = (src_x + col as i32).clamp(0, ref_w - 1) as usize;
             let dst_x = mb_x * 16 + col;
             for c in 0..channels {
                 let dst_idx = (dst_y * out_width + dst_x) * channels + c;

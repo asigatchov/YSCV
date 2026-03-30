@@ -49,8 +49,106 @@
 //! NAL -> CABAC -> CU parse -> intra/inter pred -> residual
 //! -> reconstruct -> deblock -> SAO -> chroma -> RGB output.
 
-use super::h264_decoder::BitstreamReader;
+use super::h264_bitstream::BitstreamReader;
 use crate::VideoError;
+
+// ---------------------------------------------------------------------------
+// HEVC NAL Unit Types
+// ---------------------------------------------------------------------------
+
+/// HEVC NAL unit type enumeration (ITU-T H.265, Table 7-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HevcNalUnitType {
+    TrailN,
+    TrailR,
+    TsaN,
+    TsaR,
+    StsaN,
+    StsaR,
+    RadlN,
+    RadlR,
+    RaslN,
+    RaslR,
+    BlaWLp,
+    BlaWRadl,
+    BlaNLp,
+    IdrWRadl,
+    IdrNLp,
+    CraNut,
+    VpsNut,
+    SpsNut,
+    PpsNut,
+    AudNut,
+    EosNut,
+    EobNut,
+    FdNut,
+    PrefixSeiNut,
+    SuffixSeiNut,
+    Other(u8),
+}
+
+impl HevcNalUnitType {
+    pub fn from_header(header: &[u8]) -> Self {
+        if header.is_empty() {
+            return Self::Other(0);
+        }
+        Self::from_type_byte((header[0] >> 1) & 0x3F)
+    }
+    fn from_type_byte(t: u8) -> Self {
+        match t {
+            0 => Self::TrailN,
+            1 => Self::TrailR,
+            2 => Self::TsaN,
+            3 => Self::TsaR,
+            4 => Self::StsaN,
+            5 => Self::StsaR,
+            6 => Self::RadlN,
+            7 => Self::RadlR,
+            8 => Self::RaslN,
+            9 => Self::RaslR,
+            16 => Self::BlaWLp,
+            17 => Self::BlaWRadl,
+            18 => Self::BlaNLp,
+            19 => Self::IdrWRadl,
+            20 => Self::IdrNLp,
+            21 => Self::CraNut,
+            32 => Self::VpsNut,
+            33 => Self::SpsNut,
+            34 => Self::PpsNut,
+            35 => Self::AudNut,
+            36 => Self::EosNut,
+            37 => Self::EobNut,
+            38 => Self::FdNut,
+            39 => Self::PrefixSeiNut,
+            40 => Self::SuffixSeiNut,
+            other => Self::Other(other),
+        }
+    }
+    pub fn is_vcl(&self) -> bool {
+        matches!(
+            self,
+            Self::TrailN
+                | Self::TrailR
+                | Self::TsaN
+                | Self::TsaR
+                | Self::StsaN
+                | Self::StsaR
+                | Self::RadlN
+                | Self::RadlR
+                | Self::RaslN
+                | Self::RaslR
+                | Self::BlaWLp
+                | Self::BlaWRadl
+                | Self::BlaNLp
+                | Self::IdrWRadl
+                | Self::IdrNLp
+                | Self::CraNut
+        )
+    }
+    pub fn is_idr(&self) -> bool {
+        matches!(self, Self::IdrWRadl | Self::IdrNLp)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Video Parameter Set (VPS)
@@ -164,7 +262,8 @@ pub struct CodingTreeUnit {
 
 /// Parse HEVC VPS from NAL unit payload (after the 2-byte NAL header).
 pub fn parse_hevc_vps(data: &[u8]) -> Result<HevcVps, VideoError> {
-    let mut reader = BitstreamReader::new(data);
+    let rbsp = super::h264_params::remove_emulation_prevention(data);
+    let mut reader = BitstreamReader::new(&rbsp);
     let vps_id = reader.read_bits(4)? as u8;
     reader.read_bits(2)?; // vps_base_layer_internal_flag + vps_base_layer_available_flag
     let max_layers = reader.read_bits(6)? as u8 + 1;
@@ -216,7 +315,8 @@ fn skip_profile_tier_level(
 
 /// Parse HEVC SPS from NAL unit payload (after the 2-byte NAL header).
 pub fn parse_hevc_sps(data: &[u8]) -> Result<HevcSps, VideoError> {
-    let mut reader = BitstreamReader::new(data);
+    let rbsp = super::h264_params::remove_emulation_prevention(data);
+    let mut reader = BitstreamReader::new(&rbsp);
     let vps_id = reader.read_bits(4)? as u8;
     let max_sub_layers = reader.read_bits(3)? as u8 + 1;
     let _temporal_id_nesting = reader.read_bit()?;
@@ -324,7 +424,8 @@ pub fn parse_hevc_sps(data: &[u8]) -> Result<HevcSps, VideoError> {
 
 /// Parse HEVC PPS from NAL unit payload (after the 2-byte NAL header).
 pub fn parse_hevc_pps(data: &[u8]) -> Result<HevcPps, VideoError> {
-    let mut reader = BitstreamReader::new(data);
+    let rbsp = super::h264_params::remove_emulation_prevention(data);
+    let mut reader = BitstreamReader::new(&rbsp);
 
     let pps_id = reader.read_ue()? as u8;
     let sps_id = reader.read_ue()? as u8;
@@ -1261,10 +1362,20 @@ impl HevcDecoder {
             HevcNalUnitType::IdrWRadl | HevcNalUnitType::IdrNLp => {
                 self.dpb.clear();
                 self.poc = 0;
-                self.decode_picture(payload, true)
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.decode_picture(payload, true)
+                })) {
+                    Ok(r) => r,
+                    Err(_) => Err(VideoError::Codec("HEVC decode panicked".into())),
+                }
             }
             HevcNalUnitType::CraNut => {
-                self.decode_picture(payload, true)
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.decode_picture(payload, true)
+                })) {
+                    Ok(r) => r,
+                    Err(_) => Err(VideoError::Codec("HEVC decode panicked".into())),
+                }
             }
             // P/B slice NAL types (trailing, TSA, STSA, RADL, RASL)
             HevcNalUnitType::TrailN
@@ -1277,7 +1388,12 @@ impl HevcDecoder {
             | HevcNalUnitType::RadlR
             | HevcNalUnitType::RaslN
             | HevcNalUnitType::RaslR => {
-                self.decode_picture(payload, false)
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.decode_picture(payload, false)
+                })) {
+                    Ok(r) => r,
+                    Err(_) => Err(VideoError::Codec("HEVC decode panicked".into())),
+                }
             }
             _ => Ok(None), // non-VCL or unsupported VCL
         }
@@ -1305,9 +1421,19 @@ impl HevcDecoder {
 
         let w = sps.pic_width as usize;
         let h = sps.pic_height as usize;
+        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+            return Err(VideoError::Codec(format!(
+                "HEVC frame dimensions out of range: {w}x{h}"
+            )));
+        }
         let ctu_size_log2 = sps.log2_min_cb_size + sps.log2_diff_max_min_cb_size;
+        if !(3..=7).contains(&ctu_size_log2) {
+            return Err(VideoError::Codec(format!(
+                "HEVC CTU size log2 out of range: {ctu_size_log2}"
+            )));
+        }
         let ctu_size = 1usize << ctu_size_log2;
-        let max_depth = sps.log2_diff_max_min_cb_size;
+        let max_depth = sps.log2_diff_max_min_cb_size.min(5);
 
         // Parse minimal slice header to determine slice type.
         // HEVC slice_header(): first_slice_segment_in_pic_flag(1), then if
@@ -1315,7 +1441,7 @@ impl HevcDecoder {
         // then if !first_slice: slice_segment_address, then
         // num_extra_slice_header_bits skip bits, then slice_type (ue).
         let slice_type = if payload.len() >= 3 {
-            let rbsp = super::h264_decoder::remove_emulation_prevention(payload);
+            let rbsp = super::h264_params::remove_emulation_prevention(payload);
             let mut sh_reader = crate::BitstreamReader::new(&rbsp);
             let first_slice = sh_reader.read_bit().unwrap_or(1) == 1;
             if is_keyframe {
@@ -1325,7 +1451,7 @@ impl HevcDecoder {
             if !first_slice {
                 // slice_segment_address — need to know how many bits, skip approximation
                 let bits_needed = if w > 0 && h > 0 {
-                    let ctb_count = ((w + ctu_size - 1) / ctu_size) * ((h + ctu_size - 1) / ctu_size);
+                    let ctb_count = w.div_ceil(ctu_size) * h.div_ceil(ctu_size);
                     (32 - (ctb_count as u32).leading_zeros()).max(1) as u8
                 } else {
                     1
@@ -1352,8 +1478,10 @@ impl HevcDecoder {
         // data).
         let use_cabac = payload.len() >= 2;
 
-        let mut cus = Vec::new();
-        let mut sao_list: Vec<super::hevc_filter::SaoParams> = Vec::new();
+        let est_cus = (w * h) / (8 * 8);
+        let mut cus = Vec::with_capacity(est_cus);
+        let est_ctus = w.div_ceil(64) * h.div_ceil(64);
+        let mut sao_list: Vec<super::hevc_filter::SaoParams> = Vec::with_capacity(est_ctus);
 
         if use_cabac {
             let slice_qp = pps.init_qp as i32;
@@ -1370,6 +1498,9 @@ impl HevcDecoder {
             while ctu_y < h {
                 let mut ctu_x = 0;
                 while ctu_x < w {
+                    if cabac_state.cabac.bytes_remaining() < 1 {
+                        break;
+                    }
                     // Parse SAO parameters per CTU when enabled in SPS
                     if sps.sample_adaptive_offset_enabled {
                         let left_avail = ctu_x > 0;
@@ -1467,7 +1598,7 @@ impl HevcDecoder {
         // Store reconstructed luma in DPB for future inter prediction
         self.dpb.add(super::hevc_inter::HevcReferencePicture {
             poc: self.poc,
-            luma: y_plane.to_vec(),
+            luma: y_plane,
             width: w,
             height: h,
             is_long_term: false,

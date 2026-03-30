@@ -29,795 +29,18 @@
 
 use crate::{DecodedFrame, NalUnit, NalUnitType, VideoCodec, VideoDecoder, VideoError};
 
+use super::h264_bitstream::BitstreamReader;
 use super::h264_cabac::{
     self, CabacContext, CabacDecoder, decode_coded_block_flag, decode_mb_type_i_slice,
     decode_residual_block_cabac, init_cabac_contexts,
 };
-
-// ---------------------------------------------------------------------------
-// Bitstream reader (bit-level access for Exp-Golomb / SPS / PPS parsing)
-// ---------------------------------------------------------------------------
-
-/// Reads individual bits and Exp-Golomb coded integers from a byte slice.
-pub struct BitstreamReader<'a> {
-    pub(crate) data: &'a [u8],
-    pub(crate) byte_offset: usize,
-    pub(crate) bit_offset: u8, // 0..8, bits consumed in current byte
-}
-
-impl<'a> BitstreamReader<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            byte_offset: 0,
-            bit_offset: 0,
-        }
-    }
-
-    /// Returns the number of bits remaining.
-    pub fn bits_remaining(&self) -> usize {
-        if self.byte_offset >= self.data.len() {
-            return 0;
-        }
-        (self.data.len() - self.byte_offset) * 8 - self.bit_offset as usize
-    }
-
-    /// Reads a single bit (0 or 1).
-    pub fn read_bit(&mut self) -> Result<u8, VideoError> {
-        if self.byte_offset >= self.data.len() {
-            return Err(VideoError::Codec("bitstream exhausted".into()));
-        }
-        let bit = (self.data[self.byte_offset] >> (7 - self.bit_offset)) & 1;
-        self.bit_offset += 1;
-        if self.bit_offset == 8 {
-            self.bit_offset = 0;
-            self.byte_offset += 1;
-        }
-        Ok(bit)
-    }
-
-    /// Reads `n` bits as a u32 (MSB first), n <= 32.
-    pub fn read_bits(&mut self, n: u8) -> Result<u32, VideoError> {
-        if n > 32 {
-            return Err(VideoError::Codec(format!(
-                "read_bits: requested {n} bits, max is 32"
-            )));
-        }
-        let mut value = 0u32;
-        for _ in 0..n {
-            value = (value << 1) | self.read_bit()? as u32;
-        }
-        Ok(value)
-    }
-
-    /// Reads an unsigned Exp-Golomb coded integer (ue(v)).
-    pub fn read_ue(&mut self) -> Result<u32, VideoError> {
-        let mut leading_zeros = 0u32;
-        while self.read_bit()? == 0 {
-            leading_zeros += 1;
-            if leading_zeros > 31 {
-                return Err(VideoError::Codec("exp-golomb overflow".into()));
-            }
-        }
-        if leading_zeros == 0 {
-            return Ok(0);
-        }
-        let suffix = self.read_bits(leading_zeros as u8)?;
-        Ok((1 << leading_zeros) - 1 + suffix)
-    }
-
-    /// Reads a signed Exp-Golomb coded integer (se(v)).
-    pub fn read_se(&mut self) -> Result<i32, VideoError> {
-        let code = self.read_ue()?;
-        let value = code.div_ceil(2) as i32;
-        if code % 2 == 0 { Ok(-value) } else { Ok(value) }
-    }
-
-    /// Skips `n` bits.
-    pub fn skip_bits(&mut self, n: usize) -> Result<(), VideoError> {
-        for _ in 0..n {
-            self.read_bit()?;
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SPS parsing
-// ---------------------------------------------------------------------------
-
-/// Parsed Sequence Parameter Set (subset of fields needed for frame dimensions).
-#[derive(Debug, Clone)]
-pub struct Sps {
-    pub profile_idc: u8,
-    pub level_idc: u8,
-    pub sps_id: u32,
-    pub chroma_format_idc: u32,
-    pub bit_depth_luma: u32,
-    pub bit_depth_chroma: u32,
-    pub log2_max_frame_num: u32,
-    pub pic_order_cnt_type: u32,
-    pub max_num_ref_frames: u32,
-    pub pic_width_in_mbs: u32,
-    pub pic_height_in_map_units: u32,
-    pub frame_mbs_only_flag: bool,
-    pub mb_adaptive_frame_field_flag: bool,
-    pub frame_crop_left: u32,
-    pub frame_crop_right: u32,
-    pub frame_crop_top: u32,
-    pub frame_crop_bottom: u32,
-}
-
-impl Sps {
-    /// Frame width in pixels (before cropping).
-    pub fn width(&self) -> usize {
-        (self.pic_width_in_mbs * 16) as usize
-    }
-
-    /// Frame height in pixels (before cropping).
-    pub fn height(&self) -> usize {
-        let mbs_height = if self.frame_mbs_only_flag {
-            self.pic_height_in_map_units
-        } else {
-            self.pic_height_in_map_units * 2
-        };
-        (mbs_height * 16) as usize
-    }
-
-    /// Cropped frame width.
-    ///
-    /// Returns the full width if cropping would underflow (malformed SPS).
-    pub fn cropped_width(&self) -> usize {
-        let sub_width_c = if self.chroma_format_idc == 1 { 2 } else { 1 };
-        let crop = (self.frame_crop_left + self.frame_crop_right) as usize * sub_width_c;
-        self.width().saturating_sub(crop).max(1)
-    }
-
-    /// Cropped frame height.
-    ///
-    /// Returns the full height if cropping would underflow (malformed SPS).
-    pub fn cropped_height(&self) -> usize {
-        let sub_height_c = if self.chroma_format_idc == 1 { 2 } else { 1 };
-        let factor = if self.frame_mbs_only_flag { 1 } else { 2 };
-        let crop = (self.frame_crop_top + self.frame_crop_bottom) as usize * sub_height_c * factor;
-        self.height().saturating_sub(crop).max(1)
-    }
-}
-
-/// Parses an SPS NAL unit (without the NAL header byte).
-pub fn parse_sps(nal_data: &[u8]) -> Result<Sps, VideoError> {
-    if nal_data.is_empty() {
-        return Err(VideoError::Codec("empty SPS data".into()));
-    }
-
-    // Remove emulation prevention bytes (0x00 0x00 0x03 -> 0x00 0x00)
-    let rbsp = remove_emulation_prevention(nal_data);
-    let mut r = BitstreamReader::new(&rbsp);
-
-    let profile_idc = r.read_bits(8)? as u8;
-    let _constraint_flags = r.read_bits(8)?; // constraint_set0..5_flag + reserved
-    let level_idc = r.read_bits(8)? as u8;
-    let sps_id = r.read_ue()?;
-
-    let mut chroma_format_idc = 1u32;
-    let mut bit_depth_luma = 8u32;
-    let mut bit_depth_chroma = 8u32;
-
-    // High profile extensions
-    if profile_idc == 100
-        || profile_idc == 110
-        || profile_idc == 122
-        || profile_idc == 244
-        || profile_idc == 44
-        || profile_idc == 83
-        || profile_idc == 86
-        || profile_idc == 118
-        || profile_idc == 128
-    {
-        chroma_format_idc = r.read_ue()?;
-        if chroma_format_idc == 3 {
-            let _separate_colour_plane_flag = r.read_bit()?;
-        }
-        bit_depth_luma = r.read_ue()? + 8;
-        bit_depth_chroma = r.read_ue()? + 8;
-        let _qpprime_y_zero_transform_bypass = r.read_bit()?;
-        let seq_scaling_matrix_present = r.read_bit()?;
-        if seq_scaling_matrix_present == 1 {
-            let count = if chroma_format_idc != 3 { 8 } else { 12 };
-            for _ in 0..count {
-                let present = r.read_bit()?;
-                if present == 1 {
-                    let size = if count <= 6 { 16 } else { 64 };
-                    skip_scaling_list(&mut r, size)?;
-                }
-            }
-        }
-    }
-
-    let log2_max_frame_num = r.read_ue()? + 4;
-    let pic_order_cnt_type = r.read_ue()?;
-
-    if pic_order_cnt_type == 0 {
-        let _log2_max_pic_order_cnt_lsb = r.read_ue()?;
-    } else if pic_order_cnt_type == 1 {
-        let _delta_pic_order_always_zero_flag = r.read_bit()?;
-        let _offset_for_non_ref_pic = r.read_se()?;
-        let _offset_for_top_to_bottom = r.read_se()?;
-        let num_ref_frames_in_poc = r.read_ue()?;
-        if num_ref_frames_in_poc > 255 {
-            return Err(VideoError::Codec(format!(
-                "SPS num_ref_frames_in_pic_order_cnt_cycle too large: {num_ref_frames_in_poc}"
-            )));
-        }
-        for _ in 0..num_ref_frames_in_poc {
-            let _offset = r.read_se()?;
-        }
-    }
-
-    let max_num_ref_frames = r.read_ue()?;
-    let _gaps_in_frame_num_allowed = r.read_bit()?;
-    let pic_width_in_mbs = r.read_ue()? + 1;
-    let pic_height_in_map_units = r.read_ue()? + 1;
-    let frame_mbs_only_flag = r.read_bit()? == 1;
-
-    let mb_adaptive_frame_field_flag = if !frame_mbs_only_flag {
-        r.read_bit()? == 1
-    } else {
-        false
-    };
-
-    let _direct_8x8_inference = r.read_bit()?;
-
-    let mut frame_crop_left = 0u32;
-    let mut frame_crop_right = 0u32;
-    let mut frame_crop_top = 0u32;
-    let mut frame_crop_bottom = 0u32;
-
-    let frame_cropping_flag = r.read_bit()?;
-    if frame_cropping_flag == 1 {
-        frame_crop_left = r.read_ue()?;
-        frame_crop_right = r.read_ue()?;
-        frame_crop_top = r.read_ue()?;
-        frame_crop_bottom = r.read_ue()?;
-    }
-
-    Ok(Sps {
-        profile_idc,
-        level_idc,
-        sps_id,
-        chroma_format_idc,
-        bit_depth_luma,
-        bit_depth_chroma,
-        log2_max_frame_num,
-        pic_order_cnt_type,
-        max_num_ref_frames,
-        pic_width_in_mbs,
-        pic_height_in_map_units,
-        frame_mbs_only_flag,
-        mb_adaptive_frame_field_flag,
-        frame_crop_left,
-        frame_crop_right,
-        frame_crop_top,
-        frame_crop_bottom,
-    })
-}
-
-fn skip_scaling_list(r: &mut BitstreamReader<'_>, size: usize) -> Result<(), VideoError> {
-    let mut last_scale = 8i32;
-    let mut next_scale = 8i32;
-    for _ in 0..size {
-        if next_scale != 0 {
-            let delta = r.read_se()?;
-            next_scale = (last_scale + delta + 256) % 256;
-        }
-        last_scale = if next_scale == 0 {
-            last_scale
-        } else {
-            next_scale
-        };
-    }
-    Ok(())
-}
-
-/// Removes H.264 emulation prevention bytes (0x00 0x00 0x03 -> 0x00 0x00).
-pub(crate) fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i < data.len() {
-        if i + 2 < data.len() && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x03 {
-            result.push(0x00);
-            result.push(0x00);
-            i += 3; // skip the 0x03
-        } else {
-            result.push(data[i]);
-            i += 1;
-        }
-    }
-    result
-}
-
-// ---------------------------------------------------------------------------
-// PPS parsing
-// ---------------------------------------------------------------------------
-
-/// Parsed Picture Parameter Set (subset).
-#[derive(Debug, Clone)]
-pub struct Pps {
-    pub pps_id: u32,
-    pub sps_id: u32,
-    pub entropy_coding_mode_flag: bool,
-    pub num_slice_groups: u32,
-    pub slice_group_map_type: u32,
-    /// Run-length values for FMO type 0 (interleaved).
-    pub run_length_minus1: Vec<u32>,
-    /// Top-left MB indices for FMO type 2 (foreground regions).
-    pub top_left: Vec<u32>,
-    /// Bottom-right MB indices for FMO type 2 (foreground regions).
-    pub bottom_right: Vec<u32>,
-    /// For FMO types 3–5: direction of changing slice groups.
-    pub slice_group_change_direction_flag: bool,
-    /// For FMO types 3–5: rate of change in MBs.
-    pub slice_group_change_rate: u32,
-    /// Explicit MB-to-slice-group map for FMO type 6.
-    pub slice_group_id: Vec<u32>,
-    pub num_ref_idx_l0_default_active: u32,
-    pub num_ref_idx_l1_default_active: u32,
-    pub weighted_pred_flag: bool,
-    pub weighted_bipred_idc: u32,
-    pub pic_init_qp: i32,
-}
-
-/// Parses a PPS NAL unit (without the NAL header byte).
-pub fn parse_pps(nal_data: &[u8]) -> Result<Pps, VideoError> {
-    if nal_data.is_empty() {
-        return Err(VideoError::Codec("empty PPS data".into()));
-    }
-    let rbsp = remove_emulation_prevention(nal_data);
-    let mut r = BitstreamReader::new(&rbsp);
-
-    let pps_id = r.read_ue()?;
-    let sps_id = r.read_ue()?;
-    let entropy_coding_mode_flag = r.read_bit()? == 1;
-    let _bottom_field_pic_order = r.read_bit()?;
-    let num_slice_groups = r.read_ue()? + 1;
-
-    let mut slice_group_map_type = 0u32;
-    let mut run_length_minus1 = Vec::new();
-    let mut top_left = Vec::new();
-    let mut bottom_right = Vec::new();
-    let mut slice_group_change_direction_flag = false;
-    let mut slice_group_change_rate = 0u32;
-    let mut slice_group_id = Vec::new();
-
-    if num_slice_groups > 1 {
-        slice_group_map_type = r.read_ue()?;
-        match slice_group_map_type {
-            0 => {
-                // Interleaved: run_length_minus1 for each slice group
-                for _ in 0..num_slice_groups {
-                    run_length_minus1.push(r.read_ue()?);
-                }
-            }
-            2 => {
-                // Foreground with left-over: top_left and bottom_right for each group except last
-                for _ in 0..num_slice_groups.saturating_sub(1) {
-                    top_left.push(r.read_ue()?);
-                    bottom_right.push(r.read_ue()?);
-                }
-            }
-            3..=5 => {
-                slice_group_change_direction_flag = r.read_bit()? == 1;
-                slice_group_change_rate = r.read_ue()? + 1;
-            }
-            6 => {
-                let pic_size_in_map_units = r.read_ue()? + 1;
-                let bits_needed = if num_slice_groups > 1 {
-                    (32 - (num_slice_groups - 1).leading_zeros()).max(1) as u8
-                } else {
-                    1
-                };
-                for _ in 0..pic_size_in_map_units {
-                    slice_group_id.push(r.read_bits(bits_needed)?);
-                }
-            }
-            _ => {
-                // Type 1 (dispersed): no additional data needed
-            }
-        }
-    }
-
-    let num_ref_idx_l0_default_active = r.read_ue()? + 1;
-    let num_ref_idx_l1_default_active = r.read_ue()? + 1;
-    let weighted_pred_flag = r.read_bit()? == 1;
-    let weighted_bipred_idc = r.read_bits(2)?;
-    // pic_init_qp_minus26
-    let pic_init_qp_minus26 = r.read_se()?;
-    let pic_init_qp = 26 + pic_init_qp_minus26;
-
-    Ok(Pps {
-        pps_id,
-        sps_id,
-        entropy_coding_mode_flag,
-        num_slice_groups,
-        slice_group_map_type,
-        run_length_minus1,
-        top_left,
-        bottom_right,
-        slice_group_change_direction_flag,
-        slice_group_change_rate,
-        slice_group_id,
-        num_ref_idx_l0_default_active,
-        num_ref_idx_l1_default_active,
-        weighted_pred_flag,
-        weighted_bipred_idc,
-        pic_init_qp,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Slice header
-// ---------------------------------------------------------------------------
-
-/// Weighted prediction parameters for one reference picture + component.
-#[derive(Debug, Clone, Default)]
-pub struct WeightEntry {
-    /// Weight value. Default = (1 << log2_weight_denom).
-    pub weight: i32,
-    /// Offset value. Default = 0.
-    pub offset: i32,
-}
-
-/// Weighted prediction table parsed from the slice header.
-#[derive(Debug, Clone, Default)]
-pub struct WeightTable {
-    pub luma_log2_denom: u32,
-    pub chroma_log2_denom: u32,
-    /// Per-reference luma weights for L0 list.
-    pub luma_l0: Vec<WeightEntry>,
-    /// Per-reference chroma weights for L0 list (Cb, Cr per ref).
-    pub chroma_l0: Vec<[WeightEntry; 2]>,
-    /// Per-reference luma weights for L1 list (B-slices).
-    pub luma_l1: Vec<WeightEntry>,
-    /// Per-reference chroma weights for L1 list (Cb, Cr per ref).
-    pub chroma_l1: Vec<[WeightEntry; 2]>,
-}
-
-/// Parsed slice header (subset of fields needed for IDR decoding).
-#[derive(Debug, Clone)]
-pub struct SliceHeader {
-    pub first_mb_in_slice: u32,
-    pub slice_type: u32,
-    pub pps_id: u32,
-    pub frame_num: u32,
-    /// True when this slice is a single field (top or bottom) of an interlaced picture.
-    pub field_pic_flag: bool,
-    /// When `field_pic_flag` is true, indicates this is the bottom field.
-    pub bottom_field_flag: bool,
-    pub qp: i32,
-    /// Weighted prediction table (populated when PPS weighted_pred_flag is set).
-    pub weight_table: Option<WeightTable>,
-}
-
-/// Parses the pred_weight_table() from the slice header (H.264 7.3.3.2).
-fn parse_weight_table(
-    r: &mut BitstreamReader<'_>,
-    slice_type: u32,
-    num_ref_l0: u32,
-    num_ref_l1: u32,
-    chroma_format_idc: u32,
-) -> Result<WeightTable, VideoError> {
-    let luma_log2_denom = r.read_ue()?;
-    let chroma_log2_denom = if chroma_format_idc > 0 {
-        r.read_ue()?
-    } else {
-        0
-    };
-
-    let luma_default = 1i32 << luma_log2_denom;
-    let chroma_default = 1i32 << chroma_log2_denom;
-
-    let mut luma_l0 = Vec::new();
-    let mut chroma_l0 = Vec::new();
-    for _ in 0..num_ref_l0 {
-        let luma_weight_flag = r.read_bit()? == 1;
-        if luma_weight_flag {
-            let w = r.read_se()?;
-            let o = r.read_se()?;
-            luma_l0.push(WeightEntry {
-                weight: w,
-                offset: o,
-            });
-        } else {
-            luma_l0.push(WeightEntry {
-                weight: luma_default,
-                offset: 0,
-            });
-        }
-        if chroma_format_idc > 0 {
-            let chroma_weight_flag = r.read_bit()? == 1;
-            if chroma_weight_flag {
-                let w_cb = r.read_se()?;
-                let o_cb = r.read_se()?;
-                let w_cr = r.read_se()?;
-                let o_cr = r.read_se()?;
-                chroma_l0.push([
-                    WeightEntry {
-                        weight: w_cb,
-                        offset: o_cb,
-                    },
-                    WeightEntry {
-                        weight: w_cr,
-                        offset: o_cr,
-                    },
-                ]);
-            } else {
-                chroma_l0.push([
-                    WeightEntry {
-                        weight: chroma_default,
-                        offset: 0,
-                    },
-                    WeightEntry {
-                        weight: chroma_default,
-                        offset: 0,
-                    },
-                ]);
-            }
-        }
-    }
-
-    let mut luma_l1 = Vec::new();
-    let mut chroma_l1 = Vec::new();
-    // B-slices: slice_type == 1 or 6
-    if slice_type == 1 || slice_type == 6 {
-        for _ in 0..num_ref_l1 {
-            let luma_weight_flag = r.read_bit()? == 1;
-            if luma_weight_flag {
-                let w = r.read_se()?;
-                let o = r.read_se()?;
-                luma_l1.push(WeightEntry {
-                    weight: w,
-                    offset: o,
-                });
-            } else {
-                luma_l1.push(WeightEntry {
-                    weight: luma_default,
-                    offset: 0,
-                });
-            }
-            if chroma_format_idc > 0 {
-                let chroma_weight_flag = r.read_bit()? == 1;
-                if chroma_weight_flag {
-                    let w_cb = r.read_se()?;
-                    let o_cb = r.read_se()?;
-                    let w_cr = r.read_se()?;
-                    let o_cr = r.read_se()?;
-                    chroma_l1.push([
-                        WeightEntry {
-                            weight: w_cb,
-                            offset: o_cb,
-                        },
-                        WeightEntry {
-                            weight: w_cr,
-                            offset: o_cr,
-                        },
-                    ]);
-                } else {
-                    chroma_l1.push([
-                        WeightEntry {
-                            weight: chroma_default,
-                            offset: 0,
-                        },
-                        WeightEntry {
-                            weight: chroma_default,
-                            offset: 0,
-                        },
-                    ]);
-                }
-            }
-        }
-    }
-
-    Ok(WeightTable {
-        luma_log2_denom,
-        chroma_log2_denom,
-        luma_l0,
-        chroma_l0,
-        luma_l1,
-        chroma_l1,
-    })
-}
-
-/// Parses a slice header from RBSP data (after the NAL header byte).
-fn parse_slice_header(
-    r: &mut BitstreamReader<'_>,
-    sps: &Sps,
-    pps: &Pps,
-    is_idr: bool,
-) -> Result<SliceHeader, VideoError> {
-    let first_mb_in_slice = r.read_ue()?;
-    let slice_type = r.read_ue()?;
-    let pps_id = r.read_ue()?;
-    let frame_num = r.read_bits(sps.log2_max_frame_num as u8)?;
-
-    let mut field_pic_flag = false;
-    let mut bottom_field_flag = false;
-    if !sps.frame_mbs_only_flag {
-        field_pic_flag = r.read_bit()? == 1;
-        if field_pic_flag {
-            bottom_field_flag = r.read_bit()? == 1;
-        }
-    }
-
-    if is_idr {
-        let _idr_pic_id = r.read_ue()?;
-    }
-
-    if sps.pic_order_cnt_type == 0 {
-        let log2_max_poc_lsb = sps.log2_max_frame_num; // simplified: use same log2
-        let _pic_order_cnt_lsb = r.read_bits(log2_max_poc_lsb as u8)?;
-    }
-
-    // dec_ref_pic_marking() for IDR slices
-    if is_idr {
-        let _no_output_of_prior_pics = r.read_bit()?;
-        let _long_term_reference_flag = r.read_bit()?;
-    }
-
-    // Parse weighted prediction table when applicable
-    // P-slices: type 0 or 5; B-slices: type 1 or 6
-    let is_p_slice = slice_type == 0 || slice_type == 5;
-    let is_b_slice = slice_type == 1 || slice_type == 6;
-    let weight_table = if (is_p_slice && pps.weighted_pred_flag)
-        || (is_b_slice && pps.weighted_bipred_idc == 1)
-    {
-        Some(parse_weight_table(
-            r,
-            slice_type,
-            pps.num_ref_idx_l0_default_active,
-            pps.num_ref_idx_l1_default_active,
-            sps.chroma_format_idc,
-        )?)
-    } else {
-        None
-    };
-
-    let slice_qp_delta = r.read_se()?;
-    let qp = pps.pic_init_qp + slice_qp_delta;
-
-    Ok(SliceHeader {
-        first_mb_in_slice,
-        slice_type,
-        pps_id,
-        frame_num,
-        field_pic_flag,
-        bottom_field_flag,
-        qp,
-        weight_table,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Inverse 4x4 integer DCT (H.264 specification)
-// ---------------------------------------------------------------------------
-
-/// Performs the H.264 4x4 inverse integer transform in-place.
-///
-/// The transform uses the simplified butterfly operations specified in
-/// ITU-T H.264 section 8.5.12. Coefficients should already be dequantized.
-pub fn inverse_dct_4x4(coeffs: &mut [i32; 16]) {
-    // Process rows
-    for i in 0..4 {
-        let base = i * 4;
-        let s0 = coeffs[base];
-        let s1 = coeffs[base + 1];
-        let s2 = coeffs[base + 2];
-        let s3 = coeffs[base + 3];
-
-        let e0 = s0 + s2;
-        let e1 = s0 - s2;
-        let e2 = (s1 >> 1) - s3;
-        let e3 = s1 + (s3 >> 1);
-
-        coeffs[base] = e0 + e3;
-        coeffs[base + 1] = e1 + e2;
-        coeffs[base + 2] = e1 - e2;
-        coeffs[base + 3] = e0 - e3;
-    }
-
-    // Process columns
-    for j in 0..4 {
-        let s0 = coeffs[j];
-        let s1 = coeffs[4 + j];
-        let s2 = coeffs[8 + j];
-        let s3 = coeffs[12 + j];
-
-        let e0 = s0 + s2;
-        let e1 = s0 - s2;
-        let e2 = (s1 >> 1) - s3;
-        let e3 = s1 + (s3 >> 1);
-
-        // Add 32 and right-shift by 6 for final normalization
-        coeffs[j] = (e0 + e3 + 32) >> 6;
-        coeffs[4 + j] = (e1 + e2 + 32) >> 6;
-        coeffs[8 + j] = (e1 - e2 + 32) >> 6;
-        coeffs[12 + j] = (e0 - e3 + 32) >> 6;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Inverse quantization (dequantization)
-// ---------------------------------------------------------------------------
-
-/// H.264 dequantization scale factors for qp%6, position-dependent.
-/// LevelScale(m) values from the spec for flat scaling matrices.
-const DEQUANT_SCALE: [[i32; 16]; 6] = [
-    [
-        10, 13, 10, 13, 13, 16, 13, 16, 10, 13, 10, 13, 13, 16, 13, 16,
-    ],
-    [
-        11, 14, 11, 14, 14, 18, 14, 18, 11, 14, 11, 14, 14, 18, 14, 18,
-    ],
-    [
-        13, 16, 13, 16, 16, 20, 16, 20, 13, 16, 13, 16, 16, 20, 16, 20,
-    ],
-    [
-        14, 18, 14, 18, 18, 23, 18, 23, 14, 18, 14, 18, 18, 23, 18, 23,
-    ],
-    [
-        16, 20, 16, 20, 20, 25, 20, 25, 16, 20, 16, 20, 20, 25, 20, 25,
-    ],
-    [
-        18, 23, 18, 23, 23, 29, 23, 29, 18, 23, 18, 23, 23, 29, 23, 29,
-    ],
-];
-
-/// Dequantizes a 4x4 block of transform coefficients in-place.
-///
-/// Applies H.264 inverse quantization: `level * scale[qp%6][pos] << (qp/6)`.
-/// Clamps QP to the valid range [0, 51].
-pub fn dequant_4x4(coeffs: &mut [i32; 16], qp: i32) {
-    let qp = qp.clamp(0, 51);
-    let qp_div6 = (qp / 6) as u32;
-    let qp_mod6 = (qp % 6) as usize;
-    let scale = &DEQUANT_SCALE[qp_mod6];
-
-    for i in 0..16 {
-        coeffs[i] = (coeffs[i] * scale[i]) << qp_div6;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 4x4 block zigzag scan order
-// ---------------------------------------------------------------------------
-
-/// H.264 4x4 zigzag scan order: maps scan index to (row, col) position.
-const ZIGZAG_4X4: [(usize, usize); 16] = [
-    (0, 0),
-    (0, 1),
-    (1, 0),
-    (2, 0),
-    (1, 1),
-    (0, 2),
-    (0, 3),
-    (1, 2),
-    (2, 1),
-    (3, 0),
-    (3, 1),
-    (2, 2),
-    (1, 3),
-    (2, 3),
-    (3, 2),
-    (3, 3),
-];
-
-/// Converts scan-order coefficients to 4x4 raster order.
-fn unscan_4x4(scan_coeffs: &[i32], out: &mut [i32; 16]) {
-    *out = [0i32; 16];
-    for (scan_idx, &val) in scan_coeffs.iter().enumerate().take(16) {
-        let (r, c) = ZIGZAG_4X4[scan_idx];
-        out[r * 4 + c] = val;
-    }
-}
+use super::h264_params::{
+    Pps, Sps, parse_pps, parse_slice_header, parse_sps, remove_emulation_prevention,
+};
+use super::h264_transform::{dequant_4x4, inverse_dct_4x4, unscan_4x4};
+use super::h264_yuv::{
+    chroma_dimensions, deinterlace_fields, generate_slice_group_map, yuv_to_rgb8_by_format,
+};
 
 // ---------------------------------------------------------------------------
 // Adapter: BitstreamReader -> cavlc::BitReader
@@ -970,7 +193,8 @@ fn decode_macroblock(
     // Luma DC for I_16x16
     let mut luma_dc = [0i32; 16];
     if is_i16x16 && let Some(result) = decode_cavlc_on_reader(reader, 0) {
-        let scan = super::cavlc::expand_cavlc_to_coefficients(&result, 16);
+        let mut scan = [0i32; 16];
+        super::cavlc::expand_cavlc_to_coefficients_into(&result, &mut scan);
         unscan_4x4(&scan, &mut luma_dc);
     }
 
@@ -996,31 +220,32 @@ fn decode_macroblock(
     ];
 
     for blk_idx in 0..16 {
+        let (boff_r, boff_c) = luma_block_offsets[blk_idx];
+        let block_x = px + boff_c;
+        let block_y = py + boff_r;
         let cbp_group = blk_idx / 4;
+
+        // Compute DC prediction once per block
+        let dc_pred = compute_dc_prediction_luma(y_plane, stride_y, block_x, block_y) as i32;
+
         if cbp & (1 << cbp_group) == 0 && !is_i16x16 {
-            // Not coded, apply DC prediction only
-            let dc_val = compute_dc_prediction_luma(
-                y_plane,
-                stride_y,
-                px + luma_block_offsets[blk_idx].1,
-                py + luma_block_offsets[blk_idx].0,
-            );
-            write_dc_block_luma(
-                y_plane,
-                stride_y,
-                px + luma_block_offsets[blk_idx].1,
-                py + luma_block_offsets[blk_idx].0,
-                dc_val,
-            );
+            // Not coded — fill with DC value using slice writes
+            let dc_u8 = dc_pred.clamp(0, 255) as u8;
+            for r in 0..4 {
+                let row_start = (block_y + r) * stride_y + block_x;
+                if row_start + 4 <= y_plane.len() {
+                    y_plane[row_start..row_start + 4].fill(dc_u8);
+                }
+            }
             continue;
         }
 
-        let mut coeffs_scan = vec![0i32; 16];
+        let mut coeffs_scan = [0i32; 16];
 
         if (cbp & (1 << cbp_group) != 0 || is_i16x16)
             && let Some(result) = decode_cavlc_on_reader(reader, 0)
         {
-            coeffs_scan = super::cavlc::expand_cavlc_to_coefficients(&result, 16);
+            super::cavlc::expand_cavlc_to_coefficients_into(&result, &mut coeffs_scan);
         }
 
         let mut coeffs = [0i32; 16];
@@ -1033,19 +258,16 @@ fn decode_macroblock(
         dequant_4x4(&mut coeffs, qp);
         inverse_dct_4x4(&mut coeffs);
 
-        let (boff_r, boff_c) = luma_block_offsets[blk_idx];
-        let block_x = px + boff_c;
-        let block_y = py + boff_r;
-        let dc_pred = compute_dc_prediction_luma(y_plane, stride_y, block_x, block_y);
-
+        // Write reconstructed samples using slice access (no per-pixel bounds check)
         for r in 0..4 {
-            for c in 0..4 {
-                let residual = coeffs[r * 4 + c];
-                let val = (dc_pred as i32 + residual).clamp(0, 255) as u8;
-                let idx = (block_y + r) * stride_y + block_x + c;
-                if idx < y_plane.len() {
-                    y_plane[idx] = val;
-                }
+            let row_start = (block_y + r) * stride_y + block_x;
+            if row_start + 4 <= y_plane.len() {
+                let row = &mut y_plane[row_start..row_start + 4];
+                let base = r * 4;
+                row[0] = (dc_pred + coeffs[base]).clamp(0, 255) as u8;
+                row[1] = (dc_pred + coeffs[base + 1]).clamp(0, 255) as u8;
+                row[2] = (dc_pred + coeffs[base + 2]).clamp(0, 255) as u8;
+                row[3] = (dc_pred + coeffs[base + 3]).clamp(0, 255) as u8;
             }
         }
     }
@@ -1068,40 +290,51 @@ fn decode_macroblock(
             let _dc_result = decode_cavlc_on_reader(reader, 0);
         }
 
+        let chroma_qp = chroma_qp_from_luma_qp(qp);
         for blk_idx in 0..4 {
             let (boff_r, boff_c) = chroma_block_offsets[blk_idx];
             let block_x = cpx + boff_c;
             let block_y = cpy + boff_r;
+            let dc_pred = compute_dc_prediction_chroma(plane, stride_uv, block_x, block_y) as i32;
 
             if chroma_cbp >= 2 {
                 if let Some(result) = decode_cavlc_on_reader(reader, 0) {
-                    let coeffs_scan = super::cavlc::expand_cavlc_to_coefficients(&result, 16);
+                    let mut coeffs_scan = [0i32; 16];
+                    super::cavlc::expand_cavlc_to_coefficients_into(&result, &mut coeffs_scan);
                     let mut coeffs = [0i32; 16];
                     unscan_4x4(&coeffs_scan, &mut coeffs);
 
-                    let chroma_qp = chroma_qp_from_luma_qp(qp);
                     dequant_4x4(&mut coeffs, chroma_qp);
                     inverse_dct_4x4(&mut coeffs);
 
-                    let dc_pred = compute_dc_prediction_chroma(plane, stride_uv, block_x, block_y);
-
                     for r in 0..4 {
-                        for c in 0..4 {
-                            let residual = coeffs[r * 4 + c];
-                            let val = (dc_pred as i32 + residual).clamp(0, 255) as u8;
-                            let idx = (block_y + r) * stride_uv + block_x + c;
-                            if idx < plane.len() {
-                                plane[idx] = val;
-                            }
+                        let row_start = (block_y + r) * stride_uv + block_x;
+                        if row_start + 4 <= plane.len() {
+                            let row = &mut plane[row_start..row_start + 4];
+                            let base = r * 4;
+                            row[0] = (dc_pred + coeffs[base]).clamp(0, 255) as u8;
+                            row[1] = (dc_pred + coeffs[base + 1]).clamp(0, 255) as u8;
+                            row[2] = (dc_pred + coeffs[base + 2]).clamp(0, 255) as u8;
+                            row[3] = (dc_pred + coeffs[base + 3]).clamp(0, 255) as u8;
                         }
                     }
                 } else {
-                    let dc_pred = compute_dc_prediction_chroma(plane, stride_uv, block_x, block_y);
-                    write_dc_block_chroma(plane, stride_uv, block_x, block_y, dc_pred);
+                    let dc_u8 = dc_pred.clamp(0, 255) as u8;
+                    for r in 0..4 {
+                        let row_start = (block_y + r) * stride_uv + block_x;
+                        if row_start + 4 <= plane.len() {
+                            plane[row_start..row_start + 4].fill(dc_u8);
+                        }
+                    }
                 }
             } else {
-                let dc_pred = compute_dc_prediction_chroma(plane, stride_uv, block_x, block_y);
-                write_dc_block_chroma(plane, stride_uv, block_x, block_y, dc_pred);
+                let dc_u8 = dc_pred.clamp(0, 255) as u8;
+                for r in 0..4 {
+                    let row_start = (block_y + r) * stride_uv + block_x;
+                    if row_start + 4 <= plane.len() {
+                        plane[row_start..row_start + 4].fill(dc_u8);
+                    }
+                }
             }
         }
     }
@@ -1120,7 +353,7 @@ fn decode_macroblock(
 #[allow(clippy::too_many_arguments)]
 fn decode_macroblock_cabac(
     cabac: &mut CabacDecoder<'_>,
-    contexts: &mut Vec<CabacContext>,
+    contexts: &mut [CabacContext],
     qp: i32,
     mb_x: usize,
     mb_y: usize,
@@ -1129,6 +362,7 @@ fn decode_macroblock_cabac(
     v_plane: &mut [u8],
     stride_y: usize,
     stride_uv: usize,
+    transform_8x8_mode: bool,
 ) -> Result<(), VideoError> {
     let mb_type = decode_mb_type_i_slice(cabac, contexts);
 
@@ -1171,54 +405,94 @@ fn decode_macroblock_cabac(
     let is_i16x16 = (1..=24).contains(&mb_type);
     let is_i4x4 = mb_type == 0;
 
+    // For I_4x4 in High profile: check transform_size_8x8_flag (ctx 399)
+    let use_8x8 = if is_i4x4 && transform_8x8_mode {
+        let ctx_idx = 399.min(contexts.len() - 1);
+        cabac.decode_decision(&mut contexts[ctx_idx])
+    } else {
+        false
+    };
+
     if is_i4x4 {
-        // Read intra4x4_pred_mode for each of the 16 4x4 blocks via CABAC
-        for _blk in 0..16 {
-            let prev_flag = cabac.decode_decision(&mut contexts[h264_cabac::ctx::MB_TYPE_I_START + 6]);
-            if !prev_flag {
-                // rem_intra4x4_pred_mode: 3 bits via bypass
-                let _rem_mode = h264_cabac::decode_fixed_length(cabac, 3);
+        if use_8x8 {
+            // 8x8 transform: 4 blocks of 8x8, each with prev_flag + rem_mode
+            for _blk in 0..4 {
+                let prev_flag = cabac.decode_decision(&mut contexts[68]);
+                if !prev_flag {
+                    let _rem_mode = h264_cabac::decode_fixed_length(cabac, 3);
+                }
+            }
+        } else {
+            // 4x4 transform: 16 blocks of 4x4
+            for _blk in 0..16 {
+                let prev_flag = cabac.decode_decision(&mut contexts[68]);
+                if !prev_flag {
+                    let _rem_mode = h264_cabac::decode_fixed_length(cabac, 3);
+                }
             }
         }
     }
 
-    // Chroma intra pred mode via CABAC (truncated unary, max 3)
-    let _chroma_pred_mode = h264_cabac::decode_truncated_unary(
-        cabac,
-        &mut contexts[h264_cabac::ctx::MB_TYPE_I_START + 7],
-        3,
-    );
+    // intra_chroma_pred_mode: ctxIdx 64..67, truncated unary max=3 (Table 9-34)
+    let _chroma_pred_mode = {
+        let mut val = 0u32;
+        for bin_idx in 0..3u32 {
+            let ctx = 64 + bin_idx.min(2) as usize; // ctx 64, 65, 66
+            if cabac.decode_decision(&mut contexts[ctx]) {
+                val += 1;
+            } else {
+                break;
+            }
+        }
+        val
+    };
 
-    // CBP for CABAC
+    // coded_block_pattern: ctxIdx 73..76 (luma), 77..84 (chroma) — Table 9-34
     let cbp = if is_i16x16 {
         let cbp_luma = if (mb_type - 1) / 12 >= 1 { 15 } else { 0 };
         let cbp_chroma = ((mb_type - 1) / 4) % 3;
         cbp_luma | (cbp_chroma << 4)
     } else {
-        // coded_block_pattern via CABAC: 4 luma bits + chroma bits
+        // Luma CBP: 4 bins, each with ctx 73 + ctxInc (simplified: ctxInc=0)
         let mut cbp_val = 0u32;
-        for i in 0..4 {
-            if decode_coded_block_flag(cabac, contexts, i) {
+        for i in 0..4u32 {
+            if cabac.decode_decision(&mut contexts[73]) {
                 cbp_val |= 1 << i;
             }
         }
-        // Chroma CBP: 0, 1, or 2
-        let chroma_cbp = h264_cabac::decode_truncated_unary(
-            cabac,
-            &mut contexts[h264_cabac::ctx::CODED_BLOCK_FLAG_LUMA + 4],
-            2,
-        );
+        // Chroma CBP: truncated unary, ctx 77 for bin 0, ctx 81 for bin 1
+        let c0 = cabac.decode_decision(&mut contexts[77]);
+        let chroma_cbp = if !c0 {
+            0u32
+        } else if cabac.decode_decision(&mut contexts[81]) {
+            2
+        } else {
+            1
+        };
         cbp_val | (chroma_cbp << 4)
     };
 
-    // QP delta via CABAC (Exp-Golomb bypass)
+    // mb_qp_delta: ctxIdx 60..63 ONLY, unary (Table 9-34)
     let qp = if cbp > 0 || is_i16x16 {
-        let qp_delta = h264_cabac::decode_exp_golomb_bypass(cabac, 0) as i32;
-        // Sign: even = positive, odd = negative (standard CABAC se mapping)
-        let qp_delta = if qp_delta & 1 == 0 {
-            qp_delta / 2
+        let bin0 = cabac.decode_decision(&mut contexts[60]);
+        let qp_delta = if !bin0 {
+            0i32
         } else {
-            -(qp_delta as i32 + 1) / 2
+            let mut abs_val = 1u32;
+            // Bins 1+: ctx 61 for first, ctx 62/63 for rest (capped at 63)
+            while abs_val < 52 {
+                let ctx = (60 + abs_val as usize).min(63);
+                if !cabac.decode_decision(&mut contexts[ctx]) {
+                    break;
+                }
+                abs_val += 1;
+            }
+            let sign = cabac.decode_bypass();
+            if sign {
+                -(abs_val as i32)
+            } else {
+                abs_val as i32
+            }
         };
         (qp + qp_delta).rem_euclid(52)
     } else {
@@ -1228,9 +502,9 @@ fn decode_macroblock_cabac(
     let px = mb_x * 16;
     let py = mb_y * 16;
 
-    // Luma DC for I_16x16
+    // Luma DC for I_16x16 — coded_block_flag cat=0 (Luma DC)
     let mut luma_dc = [0i32; 16];
-    if is_i16x16 {
+    if is_i16x16 && decode_coded_block_flag(cabac, contexts, 0) {
         let coeffs = decode_residual_block_cabac(cabac, contexts, 16);
         unscan_4x4(&coeffs, &mut luma_dc);
     }
@@ -1276,9 +550,11 @@ fn decode_macroblock_cabac(
         let mut coeffs = [0i32; 16];
 
         if cbp & (1 << cbp_group) != 0 || is_i16x16 {
-            // Check coded_block_flag for this 4x4 block
-            let coded = decode_coded_block_flag(cabac, contexts, blk_idx % 4);
+            // coded_block_flag: cat=2 for luma_4x4, cat=1 for luma_AC (I_16x16)
+            let cat = if is_i16x16 { 1 } else { 2 };
+            let coded = decode_coded_block_flag(cabac, contexts, cat);
             if coded {
+                // Always 16 coefficients; for I_16x16, DC position is replaced afterward
                 let coeffs_scan = decode_residual_block_cabac(cabac, contexts, 16);
                 unscan_4x4(&coeffs_scan, &mut coeffs);
             }
@@ -1321,8 +597,8 @@ fn decode_macroblock_cabac(
             &mut *v_plane
         };
 
-        // Chroma DC
-        if chroma_cbp >= 1 {
+        // Chroma DC — coded_block_flag cat=3
+        if chroma_cbp >= 1 && decode_coded_block_flag(cabac, contexts, 3) {
             let _dc_coeffs = decode_residual_block_cabac(cabac, contexts, 4);
         }
 
@@ -1332,7 +608,8 @@ fn decode_macroblock_cabac(
             let block_y = cpy + boff_r;
 
             if chroma_cbp >= 2 {
-                let coded = decode_coded_block_flag(cabac, contexts, blk_idx);
+                // coded_block_flag cat=4 (chroma AC)
+                let coded = decode_coded_block_flag(cabac, contexts, 4);
                 if coded {
                     let coeffs_scan = decode_residual_block_cabac(cabac, contexts, 16);
                     let mut coeffs = [0i32; 16];
@@ -1432,313 +709,6 @@ fn chroma_qp_from_luma_qp(qp_y: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Interlaced (MBAFF/PAFF) field-pair deinterlacing
-// ---------------------------------------------------------------------------
-
-/// Deinterlaces a field pair by interleaving top-field and bottom-field rows.
-///
-/// `top_field` and `bottom_field` each contain `height` rows of `width * 3` bytes
-/// (RGB8). The output frame has `height * 2` rows where even rows come from the
-/// top field and odd rows come from the bottom field.
-pub fn deinterlace_fields(
-    top_field: &[u8],
-    bottom_field: &[u8],
-    width: usize,
-    height: usize,
-) -> Vec<u8> {
-    let row_bytes = width * 3; // RGB
-    let mut frame = vec![0u8; height * 2 * row_bytes];
-    for y in 0..height {
-        // Even rows from top field
-        let dst_even_start = y * 2 * row_bytes;
-        let src_top_start = y * row_bytes;
-        if src_top_start + row_bytes <= top_field.len() && dst_even_start + row_bytes <= frame.len()
-        {
-            frame[dst_even_start..dst_even_start + row_bytes]
-                .copy_from_slice(&top_field[src_top_start..src_top_start + row_bytes]);
-        }
-        // Odd rows from bottom field
-        let dst_odd_start = (y * 2 + 1) * row_bytes;
-        let src_bot_start = y * row_bytes;
-        if src_bot_start + row_bytes <= bottom_field.len()
-            && dst_odd_start + row_bytes <= frame.len()
-        {
-            frame[dst_odd_start..dst_odd_start + row_bytes]
-                .copy_from_slice(&bottom_field[src_bot_start..src_bot_start + row_bytes]);
-        }
-    }
-    frame
-}
-
-// ---------------------------------------------------------------------------
-// FMO (Flexible Macroblock Ordering) — slice group map generation
-// ---------------------------------------------------------------------------
-
-/// Generates the macroblock-to-slice-group mapping for FMO.
-///
-/// When `num_slice_groups <= 1`, all MBs belong to group 0 (raster scan order,
-/// the default non-FMO case). Otherwise the mapping is determined by
-/// `slice_group_map_type` (0–6) as specified in ITU-T H.264 section 8.2.2.
-pub fn generate_slice_group_map(pps: &Pps, sps: &Sps) -> Vec<u8> {
-    let pic_width = sps.pic_width_in_mbs as usize;
-    let pic_height = sps.pic_height_in_map_units as usize;
-    let num_mbs = pic_width * pic_height;
-    let mut map = vec![0u8; num_mbs];
-
-    if pps.num_slice_groups <= 1 {
-        return map; // all MBs in group 0
-    }
-
-    let num_groups = pps.num_slice_groups as usize;
-
-    match pps.slice_group_map_type {
-        0 => {
-            // Interleaved: run_length based cyclic assignment
-            let mut i = 0;
-            loop {
-                if i >= num_mbs {
-                    break;
-                }
-                for group in 0..num_groups {
-                    let run = if group < pps.run_length_minus1.len() {
-                        pps.run_length_minus1[group] as usize + 1
-                    } else {
-                        1
-                    };
-                    for _ in 0..run {
-                        if i >= num_mbs {
-                            break;
-                        }
-                        map[i] = group as u8;
-                        i += 1;
-                    }
-                }
-            }
-        }
-        1 => {
-            // Dispersed: modular mapping
-            for i in 0..num_mbs {
-                let x = i % pic_width;
-                let y = i / pic_width;
-                let group = ((x + ((y * num_groups) / 2)) % num_groups) as u8;
-                map[i] = group;
-            }
-        }
-        2 => {
-            // Foreground with left-over: rectangular regions
-            // Initially all MBs in the last group (background)
-            let bg_group = (num_groups - 1) as u8;
-            for m in map.iter_mut() {
-                *m = bg_group;
-            }
-            // Assign foreground regions (highest group index has priority)
-            for group in (0..num_groups.saturating_sub(1)).rev() {
-                if group >= pps.top_left.len() || group >= pps.bottom_right.len() {
-                    continue;
-                }
-                let tl = pps.top_left[group] as usize;
-                let br = pps.bottom_right[group] as usize;
-                let tl_x = tl % pic_width;
-                let tl_y = tl / pic_width;
-                let br_x = br % pic_width;
-                let br_y = br / pic_width;
-                for y in tl_y..=br_y.min(pic_height.saturating_sub(1)) {
-                    for x in tl_x..=br_x.min(pic_width.saturating_sub(1)) {
-                        let idx = y * pic_width + x;
-                        if idx < num_mbs {
-                            map[idx] = group as u8;
-                        }
-                    }
-                }
-            }
-        }
-        3..=5 => {
-            // Box-out / raster-scan / wipe: evolving slice groups
-            // These types use slice_group_change_rate to determine a moving
-            // boundary. For a single-frame decode the boundary position comes
-            // from `slice_group_change_cycle` in the slice header. As a
-            // simplification we map the first `change_rate` MBs to group 0
-            // and the rest to group 1.
-            let change = (pps.slice_group_change_rate as usize).min(num_mbs);
-            for (i, m) in map.iter_mut().enumerate() {
-                *m = if i < change { 0 } else { 1 };
-            }
-        }
-        6 => {
-            // Explicit: per-MB group IDs stored in PPS
-            for (i, m) in map.iter_mut().enumerate() {
-                if i < pps.slice_group_id.len() {
-                    *m = pps.slice_group_id[i] as u8;
-                }
-            }
-        }
-        _ => {
-            // Unknown type — fall back to single group
-        }
-    }
-
-    map
-}
-
-// ---------------------------------------------------------------------------
-// Chroma format helpers (High 4:2:2 / 4:4:4 profile support)
-// ---------------------------------------------------------------------------
-
-/// Returns the chroma plane dimensions `(chroma_width, chroma_height)` given
-/// the luma dimensions and `chroma_format_idc` from the SPS.
-///
-/// - 0 = monochrome (no chroma planes)
-/// - 1 = YUV 4:2:0 (default, half width and half height)
-/// - 2 = YUV 4:2:2 (half width, full height)
-/// - 3 = YUV 4:4:4 (full width, full height)
-pub fn chroma_dimensions(width: usize, height: usize, chroma_format: u32) -> (usize, usize) {
-    match chroma_format {
-        0 => (0, 0),                  // monochrome
-        1 => (width / 2, height / 2), // 4:2:0
-        2 => (width / 2, height),     // 4:2:2
-        3 => (width, height),         // 4:4:4
-        _ => (width / 2, height / 2), // default to 4:2:0
-    }
-}
-
-/// Converts YUV 4:2:2 planar to RGB8 interleaved using BT.601 coefficients.
-///
-/// Chroma planes are half-width, full-height relative to luma.
-pub fn yuv422_to_rgb8(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    width: usize,
-    height: usize,
-) -> Result<Vec<u8>, VideoError> {
-    let expected_y = width * height;
-    let expected_uv = (width / 2) * height;
-
-    if y_plane.len() < expected_y {
-        return Err(VideoError::Codec(format!(
-            "Y plane too small: expected {expected_y}, got {}",
-            y_plane.len()
-        )));
-    }
-    if u_plane.len() < expected_uv || v_plane.len() < expected_uv {
-        return Err(VideoError::Codec(format!(
-            "UV planes too small for 4:2:2: expected {expected_uv}, got U={} V={}",
-            u_plane.len(),
-            v_plane.len()
-        )));
-    }
-
-    let mut rgb = vec![0u8; width * height * 3];
-    let uv_stride = width / 2;
-
-    for row in 0..height {
-        let y_off = row * width;
-        let uv_off = row * uv_stride;
-
-        for col in 0..width {
-            let y_val = y_plane[y_off + col] as i16;
-            let u_val = u_plane[uv_off + col / 2] as i16 - 128;
-            let v_val = v_plane[uv_off + col / 2] as i16 - 128;
-
-            let r = y_val + ((v_val * 179) >> 7);
-            let g = y_val - ((u_val * 44 + v_val * 91) >> 7);
-            let b = y_val + ((u_val * 227) >> 7);
-
-            let idx = (row * width + col) * 3;
-            rgb[idx] = r.clamp(0, 255) as u8;
-            rgb[idx + 1] = g.clamp(0, 255) as u8;
-            rgb[idx + 2] = b.clamp(0, 255) as u8;
-        }
-    }
-
-    Ok(rgb)
-}
-
-/// Converts YUV 4:4:4 planar to RGB8 interleaved using BT.601 coefficients.
-///
-/// All three planes have the same dimensions (no chroma subsampling).
-pub fn yuv444_to_rgb8(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    width: usize,
-    height: usize,
-) -> Result<Vec<u8>, VideoError> {
-    let expected = width * height;
-
-    if y_plane.len() < expected {
-        return Err(VideoError::Codec(format!(
-            "Y plane too small: expected {expected}, got {}",
-            y_plane.len()
-        )));
-    }
-    if u_plane.len() < expected || v_plane.len() < expected {
-        return Err(VideoError::Codec(format!(
-            "UV planes too small for 4:4:4: expected {expected}, got U={} V={}",
-            u_plane.len(),
-            v_plane.len()
-        )));
-    }
-
-    let mut rgb = vec![0u8; width * height * 3];
-
-    for i in 0..expected {
-        let y_val = y_plane[i] as i16;
-        let u_val = u_plane[i] as i16 - 128;
-        let v_val = v_plane[i] as i16 - 128;
-
-        let r = y_val + ((v_val * 179) >> 7);
-        let g = y_val - ((u_val * 44 + v_val * 91) >> 7);
-        let b = y_val + ((u_val * 227) >> 7);
-
-        let idx = i * 3;
-        rgb[idx] = r.clamp(0, 255) as u8;
-        rgb[idx + 1] = g.clamp(0, 255) as u8;
-        rgb[idx + 2] = b.clamp(0, 255) as u8;
-    }
-
-    Ok(rgb)
-}
-
-/// Converts a monochrome (luma-only) plane to RGB8 (grayscale).
-pub fn mono_to_rgb8(y_plane: &[u8], width: usize, height: usize) -> Result<Vec<u8>, VideoError> {
-    let expected = width * height;
-    if y_plane.len() < expected {
-        return Err(VideoError::Codec(format!(
-            "Y plane too small: expected {expected}, got {}",
-            y_plane.len()
-        )));
-    }
-    let mut rgb = vec![0u8; expected * 3];
-    for i in 0..expected {
-        let v = y_plane[i];
-        let idx = i * 3;
-        rgb[idx] = v;
-        rgb[idx + 1] = v;
-        rgb[idx + 2] = v;
-    }
-    Ok(rgb)
-}
-
-/// Dispatches YUV-to-RGB conversion based on `chroma_format_idc`.
-fn yuv_to_rgb8_by_format(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    width: usize,
-    height: usize,
-    chroma_format_idc: u32,
-) -> Result<Vec<u8>, VideoError> {
-    match chroma_format_idc {
-        0 => mono_to_rgb8(y_plane, width, height),
-        1 => yuv420_to_rgb8(y_plane, u_plane, v_plane, width, height),
-        2 => yuv422_to_rgb8(y_plane, u_plane, v_plane, width, height),
-        3 => yuv444_to_rgb8(y_plane, u_plane, v_plane, width, height),
-        _ => yuv420_to_rgb8(y_plane, u_plane, v_plane, width, height),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // H.264 Decoder
 // ---------------------------------------------------------------------------
 
@@ -1757,6 +727,12 @@ pub struct H264Decoder {
     _pending_nals: Vec<NalUnit>,
     /// Cached top-field RGB data for interlaced field-pair reconstruction.
     pending_top_field: Option<PendingField>,
+    /// Last decoded luma plane for P-slice motion compensation (YUV, full macroblock size).
+    ref_y: Vec<u8>,
+    ref_u: Vec<u8>,
+    ref_v: Vec<u8>,
+    ref_width: usize,
+    ref_height: usize,
 }
 
 /// Holds an already-decoded top field while waiting for the matching bottom field.
@@ -1776,6 +752,11 @@ impl H264Decoder {
             pps: None,
             _pending_nals: Vec::new(),
             pending_top_field: None,
+            ref_y: Vec::new(),
+            ref_u: Vec::new(),
+            ref_v: Vec::new(),
+            ref_width: 0,
+            ref_height: 0,
         }
     }
 
@@ -1800,219 +781,482 @@ impl H264Decoder {
                 self.pps = Some(parse_pps(pps_data)?);
                 Ok(None)
             }
+            NalUnitType::Slice
+            | NalUnitType::SliceA
+            | NalUnitType::SliceB
+            | NalUnitType::SliceC => {
+                // Non-IDR slices: attempt I-slice-style decode.
+                // P/B macroblocks will fallback to DC prediction (no inter prediction yet),
+                // but this is better than silently dropping frames.
+                if nal.data.len() < 2 || self.sps.is_none() || self.pps.is_none() {
+                    return Ok(None);
+                }
+                // Reuse the IDR decode path — slice header parsing handles
+                // both IDR and non-IDR slice types.
+                self.decode_slice(nal, false)
+            }
             NalUnitType::Idr => {
                 if nal.data.len() < 2 {
                     return Err(VideoError::Codec("IDR NAL unit too short".into()));
                 }
+                self.decode_slice(nal, true)
+            }
+            _ => Ok(None),
+        }
+    }
 
-                let sps = self
-                    .sps
-                    .as_ref()
-                    .ok_or_else(|| VideoError::Codec("IDR received before SPS".into()))?
-                    .clone();
-                let pps = self
-                    .pps
-                    .as_ref()
-                    .ok_or_else(|| VideoError::Codec("IDR received before PPS".into()))?
-                    .clone();
+    /// Decode a slice NAL unit (IDR or non-IDR).
+    fn decode_slice(
+        &mut self,
+        nal: &NalUnit,
+        is_idr: bool,
+    ) -> Result<Option<DecodedFrame>, VideoError> {
+        let sps = self
+            .sps
+            .as_ref()
+            .ok_or_else(|| VideoError::Codec("slice received before SPS".into()))?
+            .clone();
+        let pps = self
+            .pps
+            .as_ref()
+            .ok_or_else(|| VideoError::Codec("slice received before PPS".into()))?
+            .clone();
 
-                let w = sps.cropped_width();
-                let h = sps.cropped_height();
+        let w = sps.cropped_width();
+        let h = sps.cropped_height();
 
-                // Validate dimensions to prevent overflow in buffer allocation
-                if w == 0 || h == 0 {
-                    return Err(VideoError::Codec(
-                        "SPS yields zero-sized frame dimensions".into(),
-                    ));
-                }
-                if w > 16384 || h > 16384 {
-                    return Err(VideoError::Codec(format!(
-                        "SPS frame dimensions too large: {w}x{h} (max 16384x16384)"
-                    )));
-                }
+        // Validate dimensions to prevent overflow in buffer allocation
+        if w == 0 || h == 0 {
+            return Err(VideoError::Codec(
+                "SPS yields zero-sized frame dimensions".into(),
+            ));
+        }
+        if w > 16384 || h > 16384 {
+            return Err(VideoError::Codec(format!(
+                "SPS frame dimensions too large: {w}x{h} (max 16384x16384)"
+            )));
+        }
 
-                let mb_w = sps.pic_width_in_mbs as usize;
-                let mb_h = sps.pic_height_in_map_units as usize;
-                let full_w = mb_w
-                    .checked_mul(16)
-                    .ok_or_else(|| VideoError::Codec("macroblock width overflow".into()))?;
-                let full_h = mb_h
-                    .checked_mul(16)
-                    .ok_or_else(|| VideoError::Codec("macroblock height overflow".into()))?;
+        let mb_w = sps.pic_width_in_mbs as usize;
+        let mb_h = sps.pic_height_in_map_units as usize;
+        let full_w = mb_w
+            .checked_mul(16)
+            .ok_or_else(|| VideoError::Codec("macroblock width overflow".into()))?;
+        let full_h = mb_h
+            .checked_mul(16)
+            .ok_or_else(|| VideoError::Codec("macroblock height overflow".into()))?;
 
-                // Remove emulation prevention bytes and parse slice header
-                let rbsp = remove_emulation_prevention(&nal.data[1..]);
-                let mut reader = BitstreamReader::new(&rbsp);
+        // Remove emulation prevention bytes and parse slice header
+        let rbsp = remove_emulation_prevention(&nal.data[1..]);
+        let mut reader = BitstreamReader::new(&rbsp);
 
-                let slice_header = match parse_slice_header(&mut reader, &sps, &pps, true) {
-                    Ok(sh) => sh,
-                    Err(_) => {
-                        // If slice header parsing fails, fall back to gray frame
-                        let rgb8_data = vec![128u8; w * h * 3];
-                        return Ok(Some(DecodedFrame {
-                            width: w,
-                            height: h,
-                            rgb8_data,
-                            timestamp_us: 0,
-                            keyframe: true,
-                        }));
-                    }
-                };
-
-                // Compute chroma plane dimensions based on chroma_format_idc
-                let (chroma_w, chroma_h) = chroma_dimensions(full_w, full_h, sps.chroma_format_idc);
-
-                // Allocate YUV planes initialized to neutral values
-                let mut y_plane = vec![128u8; full_w * full_h];
-                let mut u_plane = vec![128u8; chroma_w.max(1) * chroma_h.max(1)];
-                let mut v_plane = vec![128u8; chroma_w.max(1) * chroma_h.max(1)];
-
-                let stride_y = full_w;
-                let stride_uv = chroma_w.max(1);
-
-                // Generate FMO slice-group map (identity for non-FMO streams)
-                let _slice_group_map = generate_slice_group_map(&pps, &sps);
-
-                // Decode each macroblock; on any bitstream error, stop and
-                // return whatever has been decoded so far.
-                if pps.entropy_coding_mode_flag {
-                    // CABAC mode: align to byte boundary and create CABAC decoder
-                    if reader.bit_offset != 0 {
-                        let skip = 8 - reader.bit_offset as usize;
-                        let _ = reader.skip_bits(skip);
-                    }
-                    let cabac_data = &rbsp[reader.byte_offset..];
-                    let mut cabac = CabacDecoder::new(cabac_data);
-                    let mut contexts = init_cabac_contexts(slice_header.qp);
-
-                    for mb_idx in 0..(mb_w * mb_h) {
-                        let mb_x = mb_idx % mb_w;
-                        let mb_y = mb_idx / mb_w;
-
-                        if cabac.bytes_remaining() < 1 {
-                            break;
-                        }
-
-                        // Check end_of_slice_flag before each macroblock (except first)
-                        if mb_idx > 0 && cabac.decode_terminate() {
-                            break;
-                        }
-
-                        if decode_macroblock_cabac(
-                            &mut cabac,
-                            &mut contexts,
-                            slice_header.qp,
-                            mb_x,
-                            mb_y,
-                            &mut y_plane,
-                            &mut u_plane,
-                            &mut v_plane,
-                            stride_y,
-                            stride_uv,
-                        )
-                        .is_err()
-                        {
-                            break;
-                        }
-                    }
-                } else {
-                    // CAVLC mode (original path)
-                    for mb_idx in 0..(mb_w * mb_h) {
-                        let mb_x = mb_idx % mb_w;
-                        let mb_y = mb_idx / mb_w;
-
-                        if reader.bits_remaining() < 8 {
-                            break;
-                        }
-
-                        if decode_macroblock(
-                            &mut reader,
-                            slice_header.qp,
-                            mb_x,
-                            mb_y,
-                            &mut y_plane,
-                            &mut u_plane,
-                            &mut v_plane,
-                            stride_y,
-                            stride_uv,
-                        )
-                        .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-
-                // Convert YUV to RGB8 using the appropriate chroma format
-                let rgb8_full = yuv_to_rgb8_by_format(
-                    &y_plane,
-                    &u_plane,
-                    &v_plane,
-                    full_w,
-                    full_h,
-                    sps.chroma_format_idc,
-                )?;
-
-                // Crop to actual dimensions if needed
-                let rgb8_data = if full_w == w && full_h == h {
-                    rgb8_full
-                } else if w <= full_w && h <= full_h {
-                    let mut cropped = vec![0u8; w * h * 3];
-                    for row in 0..h {
-                        let src_start = row * full_w * 3;
-                        let dst_start = row * w * 3;
-                        if src_start + w * 3 <= rgb8_full.len()
-                            && dst_start + w * 3 <= cropped.len()
-                        {
-                            cropped[dst_start..dst_start + w * 3]
-                                .copy_from_slice(&rgb8_full[src_start..src_start + w * 3]);
-                        }
-                    }
-                    cropped
-                } else {
-                    return Err(VideoError::Codec(
-                        "cropped dimensions exceed full frame size".into(),
-                    ));
-                };
-
-                // Handle interlaced field-pair reconstruction
-                if slice_header.field_pic_flag {
-                    if !slice_header.bottom_field_flag {
-                        // Top field — stash it and wait for bottom field
-                        self.pending_top_field = Some(PendingField {
-                            rgb_data: rgb8_data,
-                            width: w,
-                            height: h,
-                            timestamp_us: 0,
-                        });
-                        return Ok(None);
-                    }
-                    // Bottom field — combine with pending top field
-                    if let Some(top) = self.pending_top_field.take() {
-                        let frame_h = top.height + h;
-                        let deinterlaced =
-                            deinterlace_fields(&top.rgb_data, &rgb8_data, w, h.min(top.height));
-                        return Ok(Some(DecodedFrame {
-                            width: w,
-                            height: frame_h,
-                            rgb8_data: deinterlaced,
-                            timestamp_us: top.timestamp_us,
-                            keyframe: true,
-                        }));
-                    }
-                    // No top field buffered — return bottom field as-is
-                }
-
-                Ok(Some(DecodedFrame {
+        let slice_header = match parse_slice_header(&mut reader, &sps, &pps, is_idr) {
+            Ok(sh) => sh,
+            Err(_) => {
+                // If slice header parsing fails, fall back to gray frame
+                let rgb8_data = vec![128u8; w * h * 3];
+                return Ok(Some(DecodedFrame {
                     width: w,
                     height: h,
                     rgb8_data,
                     timestamp_us: 0,
                     keyframe: true,
-                }))
+                }));
             }
-            _ => Ok(None),
+        };
+
+        // Compute chroma plane dimensions based on chroma_format_idc
+        let (chroma_w, chroma_h) = chroma_dimensions(full_w, full_h, sps.chroma_format_idc);
+
+        // Allocate YUV planes — for non-IDR, initialize from reference frame
+        let mut y_plane;
+        let mut u_plane;
+        let mut v_plane;
+        if !is_idr
+            && self.ref_width == full_w
+            && self.ref_height == full_h
+            && !self.ref_y.is_empty()
+        {
+            // Take ownership of reference frame (no clone) for P/B prediction
+            y_plane = std::mem::take(&mut self.ref_y);
+            u_plane = std::mem::take(&mut self.ref_u);
+            v_plane = std::mem::take(&mut self.ref_v);
+        } else {
+            y_plane = vec![128u8; full_w * full_h];
+            u_plane = vec![128u8; chroma_w.max(1) * chroma_h.max(1)];
+            v_plane = vec![128u8; chroma_w.max(1) * chroma_h.max(1)];
         }
+
+        let stride_y = full_w;
+        let stride_uv = chroma_w.max(1);
+
+        // Generate FMO slice-group map (identity for non-FMO streams)
+        let _slice_group_map = generate_slice_group_map(&pps, &sps);
+
+        // Determine if this is an inter slice (P or B)
+        let is_p_slice = slice_header.slice_type == 0 || slice_header.slice_type == 5;
+        let is_b_slice = slice_header.slice_type == 1 || slice_header.slice_type == 6;
+        let is_inter = is_p_slice || is_b_slice;
+
+        // MV grid for P-slice median prediction
+        let mut mv_grid = vec![super::h264_motion::MotionVector::default(); mb_w * mb_h];
+        // Track which MBs were skipped (for skip-aware deblocking)
+        let mut mb_is_skip = vec![false; mb_w * mb_h];
+
+        // Decode each macroblock; on any bitstream error, stop and
+        // return whatever has been decoded so far.
+        if pps.entropy_coding_mode_flag {
+            // CABAC mode: read cabac_alignment_one_bit and align to byte boundary.
+            while reader.bit_offset != 0 {
+                let _ = reader.read_bit();
+            }
+            let cabac_data = &rbsp[reader.byte_offset..];
+            let mut cabac = CabacDecoder::new(cabac_data);
+            let mut contexts = init_cabac_contexts(slice_header.qp);
+
+            for mb_idx in 0..(mb_w * mb_h) {
+                let mb_x = mb_idx % mb_w;
+                let mb_y = mb_idx / mb_w;
+
+                if cabac.bytes_remaining() < 1 {
+                    break;
+                }
+
+                // Check end_of_slice_flag before each macroblock (except first)
+                if mb_idx > 0 && cabac.decode_terminate() {
+                    break;
+                }
+
+                // For P/B slices: check mb_skip_flag (CABAC ctx 11..13)
+                if is_inter {
+                    let skip_ctx = 11.min(contexts.len() - 1);
+                    let mb_skip = cabac.decode_decision(&mut contexts[skip_ctx]);
+                    if mb_skip {
+                        mb_is_skip[mb_y * mb_w + mb_x] = true;
+                        // Skipped MB: motion vector = predicted from neighbors, copy from ref
+                        let left = if mb_x > 0 {
+                            mv_grid[mb_y * mb_w + mb_x - 1]
+                        } else {
+                            Default::default()
+                        };
+                        let top = if mb_y > 0 {
+                            mv_grid[(mb_y - 1) * mb_w + mb_x]
+                        } else {
+                            Default::default()
+                        };
+                        let top_right = if mb_y > 0 && mb_x + 1 < mb_w {
+                            mv_grid[(mb_y - 1) * mb_w + mb_x + 1]
+                        } else {
+                            Default::default()
+                        };
+                        let mv = super::h264_motion::predict_mv(left, top, top_right);
+                        mv_grid[mb_y * mb_w + mb_x] = mv;
+
+                        // Apply motion compensation from reference
+                        if !self.ref_y.is_empty() && self.ref_width == full_w {
+                            super::h264_motion::motion_compensate_16x16(
+                                &self.ref_y,
+                                full_w,
+                                full_h,
+                                1,
+                                mv,
+                                mb_x,
+                                mb_y,
+                                &mut y_plane,
+                                full_w,
+                            );
+                        }
+                        continue;
+                    }
+
+                    // Non-skipped inter MB: check mb_type
+                    let p_mb_type = h264_cabac::decode_mb_type_p_slice(&mut cabac, &mut contexts);
+                    if p_mb_type < 5 {
+                        // Inter MB (P_L0_16x16 etc): parse MVD and motion compensate
+                        // MVD: bypass-coded signed values
+                        let mvd_x = {
+                            let abs = h264_cabac::decode_exp_golomb_bypass(&mut cabac, 0);
+                            let sign = if abs > 0 {
+                                cabac.decode_bypass()
+                            } else {
+                                false
+                            };
+                            if sign { -(abs as i16) } else { abs as i16 }
+                        };
+                        let mvd_y = {
+                            let abs = h264_cabac::decode_exp_golomb_bypass(&mut cabac, 0);
+                            let sign = if abs > 0 {
+                                cabac.decode_bypass()
+                            } else {
+                                false
+                            };
+                            if sign { -(abs as i16) } else { abs as i16 }
+                        };
+
+                        let left = if mb_x > 0 {
+                            mv_grid[mb_y * mb_w + mb_x - 1]
+                        } else {
+                            Default::default()
+                        };
+                        let top = if mb_y > 0 {
+                            mv_grid[(mb_y - 1) * mb_w + mb_x]
+                        } else {
+                            Default::default()
+                        };
+                        let top_right = if mb_y > 0 && mb_x + 1 < mb_w {
+                            mv_grid[(mb_y - 1) * mb_w + mb_x + 1]
+                        } else {
+                            Default::default()
+                        };
+                        let pred = super::h264_motion::predict_mv(left, top, top_right);
+                        let mv = super::h264_motion::MotionVector {
+                            dx: pred.dx + mvd_x,
+                            dy: pred.dy + mvd_y,
+                            ref_idx: 0,
+                        };
+                        mv_grid[mb_y * mb_w + mb_x] = mv;
+
+                        if !self.ref_y.is_empty() && self.ref_width == full_w {
+                            super::h264_motion::motion_compensate_16x16(
+                                &self.ref_y,
+                                full_w,
+                                full_h,
+                                1,
+                                mv,
+                                mb_x,
+                                mb_y,
+                                &mut y_plane,
+                                full_w,
+                            );
+                        }
+                        continue;
+                    }
+                    // p_mb_type >= 5 → intra MB in P-slice, fall through to intra decode
+                }
+
+                if decode_macroblock_cabac(
+                    &mut cabac,
+                    &mut contexts,
+                    slice_header.qp,
+                    mb_x,
+                    mb_y,
+                    &mut y_plane,
+                    &mut u_plane,
+                    &mut v_plane,
+                    stride_y,
+                    stride_uv,
+                    pps.transform_8x8_mode_flag,
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+        } else {
+            // CAVLC mode
+            let mut cavlc_skip_remaining = 0u32;
+            for mb_idx in 0..(mb_w * mb_h) {
+                let mb_x = mb_idx % mb_w;
+                let mb_y = mb_idx / mb_w;
+
+                if reader.bits_remaining() < 8 {
+                    break;
+                }
+
+                // P/B slice: parse mb_skip_run (consecutive skipped MBs)
+                if is_inter {
+                    if cavlc_skip_remaining == 0 {
+                        cavlc_skip_remaining = reader.read_ue().unwrap_or(0);
+                    }
+                    if cavlc_skip_remaining > 0 {
+                        cavlc_skip_remaining -= 1;
+                        mb_is_skip[mb_y * mb_w + mb_x] = true;
+                        // Skipped MB: predict MV from neighbors, motion compensate
+                        let left = if mb_x > 0 {
+                            mv_grid[mb_y * mb_w + mb_x - 1]
+                        } else {
+                            Default::default()
+                        };
+                        let top = if mb_y > 0 {
+                            mv_grid[(mb_y - 1) * mb_w + mb_x]
+                        } else {
+                            Default::default()
+                        };
+                        let top_right = if mb_y > 0 && mb_x + 1 < mb_w {
+                            mv_grid[(mb_y - 1) * mb_w + mb_x + 1]
+                        } else {
+                            Default::default()
+                        };
+                        let mv = super::h264_motion::predict_mv(left, top, top_right);
+                        mv_grid[mb_y * mb_w + mb_x] = mv;
+
+                        if !self.ref_y.is_empty() && self.ref_width == full_w {
+                            super::h264_motion::motion_compensate_16x16(
+                                &self.ref_y,
+                                full_w,
+                                full_h,
+                                1,
+                                mv,
+                                mb_x,
+                                mb_y,
+                                &mut y_plane,
+                                full_w,
+                            );
+                        }
+                        continue;
+                    }
+
+                    // Non-skipped: parse mb_type
+                    let mb_type_raw = reader.read_ue().unwrap_or(0);
+                    if mb_type_raw < 5 {
+                        // Inter MB: P_L0_16x16 (0), P_L0_L0_16x8 (1), etc.
+                        let mvd_x = reader.read_se().unwrap_or(0) as i16;
+                        let mvd_y = reader.read_se().unwrap_or(0) as i16;
+
+                        let left = if mb_x > 0 {
+                            mv_grid[mb_y * mb_w + mb_x - 1]
+                        } else {
+                            Default::default()
+                        };
+                        let top = if mb_y > 0 {
+                            mv_grid[(mb_y - 1) * mb_w + mb_x]
+                        } else {
+                            Default::default()
+                        };
+                        let top_right = if mb_y > 0 && mb_x + 1 < mb_w {
+                            mv_grid[(mb_y - 1) * mb_w + mb_x + 1]
+                        } else {
+                            Default::default()
+                        };
+                        let pred = super::h264_motion::predict_mv(left, top, top_right);
+                        let mv = super::h264_motion::MotionVector {
+                            dx: pred.dx + mvd_x,
+                            dy: pred.dy + mvd_y,
+                            ref_idx: 0,
+                        };
+                        mv_grid[mb_y * mb_w + mb_x] = mv;
+
+                        if !self.ref_y.is_empty() && self.ref_width == full_w {
+                            super::h264_motion::motion_compensate_16x16(
+                                &self.ref_y,
+                                full_w,
+                                full_h,
+                                1,
+                                mv,
+                                mb_x,
+                                mb_y,
+                                &mut y_plane,
+                                full_w,
+                            );
+                        }
+                        // Skip residual for now (simplified P-slice)
+                        continue;
+                    }
+                    // mb_type >= 5 → intra MB in P-slice
+                    // Fall through to normal intra decode (mb_type adjusted)
+                }
+
+                if decode_macroblock(
+                    &mut reader,
+                    slice_header.qp,
+                    mb_x,
+                    mb_y,
+                    &mut y_plane,
+                    &mut u_plane,
+                    &mut v_plane,
+                    stride_y,
+                    stride_uv,
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+        }
+
+        // Apply deblocking filter (skip edges between two skip-MBs)
+        super::h264_deblock::deblock_frame_skip_aware(
+            &mut y_plane,
+            full_w,
+            full_h,
+            1, // single luma channel
+            slice_header.qp.clamp(0, 51) as u8,
+            &mb_is_skip,
+            mb_w,
+        );
+
+        // Convert YUV to RGB8 first (needs borrowing y/u/v planes)
+        let rgb8_full = yuv_to_rgb8_by_format(
+            &y_plane,
+            &u_plane,
+            &v_plane,
+            full_w,
+            full_h,
+            sps.chroma_format_idc,
+        )?;
+
+        // Store as reference for future P/B slices (move, no clone)
+        self.ref_y = y_plane;
+        self.ref_u = u_plane;
+        self.ref_v = v_plane;
+        self.ref_width = full_w;
+        self.ref_height = full_h;
+
+        // Crop to actual dimensions if needed
+        let rgb8_data = if full_w == w && full_h == h {
+            rgb8_full
+        } else if w <= full_w && h <= full_h {
+            let mut cropped = vec![0u8; w * h * 3];
+            for row in 0..h {
+                let src_start = row * full_w * 3;
+                let dst_start = row * w * 3;
+                if src_start + w * 3 <= rgb8_full.len() && dst_start + w * 3 <= cropped.len() {
+                    cropped[dst_start..dst_start + w * 3]
+                        .copy_from_slice(&rgb8_full[src_start..src_start + w * 3]);
+                }
+            }
+            cropped
+        } else {
+            return Err(VideoError::Codec(
+                "cropped dimensions exceed full frame size".into(),
+            ));
+        };
+
+        // Handle interlaced field-pair reconstruction
+        if slice_header.field_pic_flag {
+            if !slice_header.bottom_field_flag {
+                // Top field — stash it and wait for bottom field
+                self.pending_top_field = Some(PendingField {
+                    rgb_data: rgb8_data,
+                    width: w,
+                    height: h,
+                    timestamp_us: 0,
+                });
+                return Ok(None);
+            }
+            // Bottom field — combine with pending top field
+            if let Some(top) = self.pending_top_field.take() {
+                let frame_h = top.height + h;
+                let deinterlaced =
+                    deinterlace_fields(&top.rgb_data, &rgb8_data, w, h.min(top.height));
+                return Ok(Some(DecodedFrame {
+                    width: w,
+                    height: frame_h,
+                    rgb8_data: deinterlaced,
+                    timestamp_us: top.timestamp_us,
+                    keyframe: true,
+                }));
+            }
+            // No top field buffered — return bottom field as-is
+        }
+
+        Ok(Some(DecodedFrame {
+            width: w,
+            height: h,
+            rgb8_data,
+            timestamp_us: 0,
+            keyframe: is_idr,
+        }))
     }
 }
 
@@ -2051,739 +1295,10 @@ impl VideoDecoder for H264Decoder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// YUV to RGB conversion
-// ---------------------------------------------------------------------------
-
-/// Converts YUV 4:2:0 planar to RGB8 interleaved using BT.601 coefficients.
-///
-/// Input: separate Y, U, V planes. Y is `width * height`, U and V are `(width/2) * (height/2)`.
-/// Output: RGB8 interleaved, `width * height * 3` bytes.
-///
-/// Uses SIMD (NEON on aarch64, SSE2 on x86_64) with fixed-point i16 arithmetic
-/// and multi-threaded row processing for high throughput.
-#[allow(unsafe_code)]
-pub fn yuv420_to_rgb8(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    width: usize,
-    height: usize,
-) -> Result<Vec<u8>, VideoError> {
-    let expected_y = width * height;
-    let expected_uv = (width / 2) * (height / 2);
-
-    if y_plane.len() < expected_y {
-        return Err(VideoError::Codec(format!(
-            "Y plane too small: expected {expected_y}, got {}",
-            y_plane.len()
-        )));
-    }
-    if u_plane.len() < expected_uv || v_plane.len() < expected_uv {
-        return Err(VideoError::Codec(format!(
-            "UV planes too small: expected {expected_uv}, got U={} V={}",
-            u_plane.len(),
-            v_plane.len()
-        )));
-    }
-
-    let mut rgb = vec![0u8; width * height * 3];
-    let uv_stride = width / 2;
-
-    if height < 4 {
-        // Single-threaded path for very small images.
-        yuv420_to_rgb8_rows(
-            y_plane, u_plane, v_plane, &mut rgb, width, uv_stride, 0, height,
-        );
-    } else {
-        // Use rayon par_chunks_mut for near-zero thread dispatch overhead
-        // (rayon reuses a warm thread pool vs std::thread::scope which spawns
-        // new threads each call).
-        use rayon::prelude::*;
-
-        let row_bytes = width * 3;
-        rgb.par_chunks_mut(row_bytes)
-            .enumerate()
-            .for_each(|(row_idx, row_slice)| {
-                yuv420_to_rgb8_rows(
-                    y_plane,
-                    u_plane,
-                    v_plane,
-                    row_slice,
-                    width,
-                    uv_stride,
-                    row_idx,
-                    row_idx + 1,
-                );
-            });
-    }
-
-    Ok(rgb)
-}
-
-/// Convert rows `start_row..end_row` from YUV420 to RGB8.
-/// `rgb_out` starts at the byte corresponding to `start_row`.
-#[inline]
-#[allow(unsafe_code)]
-fn yuv420_to_rgb8_rows(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    rgb_out: &mut [u8],
-    width: usize,
-    uv_stride: usize,
-    start_row: usize,
-    end_row: usize,
-) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            // SAFETY: feature detected at runtime.
-            unsafe {
-                yuv420_to_rgb8_rows_neon(
-                    y_plane, u_plane, v_plane, rgb_out, width, uv_stride, start_row, end_row,
-                );
-            }
-            return;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") {
-            unsafe {
-                yuv420_to_rgb8_rows_avx2(
-                    y_plane, u_plane, v_plane, rgb_out, width, uv_stride, start_row, end_row,
-                );
-            }
-            return;
-        }
-        if is_x86_feature_detected!("sse2") {
-            unsafe {
-                yuv420_to_rgb8_rows_sse2(
-                    y_plane, u_plane, v_plane, rgb_out, width, uv_stride, start_row, end_row,
-                );
-            }
-            return;
-        }
-    }
-
-    yuv420_to_rgb8_rows_scalar(
-        y_plane, u_plane, v_plane, rgb_out, width, uv_stride, start_row, end_row,
-    );
-}
-
-/// Scalar fallback for YUV420→RGB8 conversion.
-#[inline]
-fn yuv420_to_rgb8_rows_scalar(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    rgb_out: &mut [u8],
-    width: usize,
-    uv_stride: usize,
-    start_row: usize,
-    end_row: usize,
-) {
-    // BT.601 fixed-point constants (Q7, fits in i16 without overflow):
-    // 1.402 * 128 ≈ 179, 0.344 * 128 ≈ 44, 0.714 * 128 ≈ 91, 1.772 * 128 ≈ 227
-    // R = Y + (V-128)*179 >> 7
-    // G = Y - ((U-128)*44 + (V-128)*91) >> 7
-    // B = Y + (U-128)*227 >> 7
-    for row in start_row..end_row {
-        let out_row = row - start_row;
-        let y_row_off = row * width;
-        let uv_row_off = (row / 2) * uv_stride;
-
-        for col in 0..width {
-            let y_val = y_plane[y_row_off + col] as i16;
-            let u_val = u_plane[uv_row_off + col / 2] as i16 - 128;
-            let v_val = v_plane[uv_row_off + col / 2] as i16 - 128;
-
-            let r = y_val + ((v_val * 179) >> 7);
-            let g = y_val - ((u_val * 44 + v_val * 91) >> 7);
-            let b = y_val + ((u_val * 227) >> 7);
-
-            let idx = (out_row * width + col) * 3;
-            rgb_out[idx] = r.clamp(0, 255) as u8;
-            rgb_out[idx + 1] = g.clamp(0, 255) as u8;
-            rgb_out[idx + 2] = b.clamp(0, 255) as u8;
-        }
-    }
-}
-
-/// NEON-accelerated YUV420→RGB8 conversion (aarch64).
-/// Processes 8 pixels per iteration using i16 fixed-point arithmetic.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
-unsafe fn yuv420_to_rgb8_rows_neon(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    rgb_out: &mut [u8],
-    width: usize,
-    uv_stride: usize,
-    start_row: usize,
-    end_row: usize,
-) {
-    use std::arch::aarch64::*;
-
-    // BT.601 fixed-point Q7 constants (fit in i16 without overflow)
-    let c_179 = vdupq_n_s16(179); // 1.402 * 128
-    let c_44 = vdupq_n_s16(44); // 0.344 * 128
-    let c_91 = vdupq_n_s16(91); // 0.714 * 128
-    let c_227 = vdupq_n_s16(227); // 1.772 * 128
-    let c_128 = vdupq_n_s16(128);
-
-    for row in start_row..end_row {
-        let out_row = row - start_row;
-        let y_row_ptr = y_plane.as_ptr().add(row * width);
-        let uv_row = (row / 2) * uv_stride;
-        let u_row_ptr = u_plane.as_ptr().add(uv_row);
-        let v_row_ptr = v_plane.as_ptr().add(uv_row);
-        let rgb_row_ptr = rgb_out.as_mut_ptr().add(out_row * width * 3);
-
-        let mut col = 0usize;
-
-        // Process 16 pixels per iteration (16 Y, 8 U, 8 V)
-        while col + 16 <= width {
-            // Load 16 Y values
-            let y16 = vld1q_u8(y_row_ptr.add(col));
-            // Load 8 U and 8 V values, each covers 16 horizontal pixels
-            let u8_vals = vld1_u8(u_row_ptr.add(col / 2));
-            let v8_vals = vld1_u8(v_row_ptr.add(col / 2));
-
-            // Duplicate each U/V to cover 2 pixels horizontally → 16 values
-            let u16_dup = vcombine_u8(vzip1_u8(u8_vals, u8_vals), vzip2_u8(u8_vals, u8_vals));
-            let v16_dup = vcombine_u8(vzip1_u8(v8_vals, v8_vals), vzip2_u8(v8_vals, v8_vals));
-
-            // Process low 8 pixels
-            let y_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(y16)));
-            let u_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(u16_dup))), c_128);
-            let v_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v16_dup))), c_128);
-
-            // R = Y + (V * 359) >> 8
-            let r_lo = vaddq_s16(y_lo, vshrq_n_s16::<7>(vmulq_s16(v_lo, c_179)));
-            // G = Y - ((U * 88 + V * 183) >> 8)
-            let g_lo = vsubq_s16(
-                y_lo,
-                vshrq_n_s16::<7>(vaddq_s16(vmulq_s16(u_lo, c_44), vmulq_s16(v_lo, c_91))),
-            );
-            // B = Y + (U * 454) >> 8
-            let b_lo = vaddq_s16(y_lo, vshrq_n_s16::<7>(vmulq_s16(u_lo, c_227)));
-
-            // Saturate to u8
-            let r_lo_u8 = vqmovun_s16(r_lo);
-            let g_lo_u8 = vqmovun_s16(g_lo);
-            let b_lo_u8 = vqmovun_s16(b_lo);
-
-            // Process high 8 pixels
-            let y_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(y16)));
-            let u_hi = vsubq_s16(
-                vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(u16_dup))),
-                c_128,
-            );
-            let v_hi = vsubq_s16(
-                vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v16_dup))),
-                c_128,
-            );
-
-            let r_hi = vaddq_s16(y_hi, vshrq_n_s16::<7>(vmulq_s16(v_hi, c_179)));
-            let g_hi = vsubq_s16(
-                y_hi,
-                vshrq_n_s16::<7>(vaddq_s16(vmulq_s16(u_hi, c_44), vmulq_s16(v_hi, c_91))),
-            );
-            let b_hi = vaddq_s16(y_hi, vshrq_n_s16::<7>(vmulq_s16(u_hi, c_227)));
-
-            let r_hi_u8 = vqmovun_s16(r_hi);
-            let g_hi_u8 = vqmovun_s16(g_hi);
-            let b_hi_u8 = vqmovun_s16(b_hi);
-
-            // Interleave R, G, B into RGB8 and store
-            let rgb_lo = uint8x8x3_t(r_lo_u8, g_lo_u8, b_lo_u8);
-            vst3_u8(rgb_row_ptr.add(col * 3), rgb_lo);
-
-            let rgb_hi = uint8x8x3_t(r_hi_u8, g_hi_u8, b_hi_u8);
-            vst3_u8(rgb_row_ptr.add((col + 8) * 3), rgb_hi);
-
-            col += 16;
-        }
-
-        // Process 8 pixels
-        if col + 8 <= width {
-            let y8_vals = vld1_u8(y_row_ptr.add(col));
-            let u4_vals_raw = u_row_ptr.add(col / 2);
-            let v4_vals_raw = v_row_ptr.add(col / 2);
-
-            // Load 4 U/V values manually and duplicate
-            let mut u_buf = [0u8; 8];
-            let mut v_buf = [0u8; 8];
-            for i in 0..4 {
-                u_buf[i * 2] = *u4_vals_raw.add(i);
-                u_buf[i * 2 + 1] = *u4_vals_raw.add(i);
-                v_buf[i * 2] = *v4_vals_raw.add(i);
-                v_buf[i * 2 + 1] = *v4_vals_raw.add(i);
-            }
-            let u8_dup = vld1_u8(u_buf.as_ptr());
-            let v8_dup = vld1_u8(v_buf.as_ptr());
-
-            let y_i16 = vreinterpretq_s16_u16(vmovl_u8(y8_vals));
-            let u_i16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8_dup)), c_128);
-            let v_i16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8_dup)), c_128);
-
-            let r = vaddq_s16(y_i16, vshrq_n_s16::<7>(vmulq_s16(v_i16, c_179)));
-            let g = vsubq_s16(
-                y_i16,
-                vshrq_n_s16::<7>(vaddq_s16(vmulq_s16(u_i16, c_44), vmulq_s16(v_i16, c_91))),
-            );
-            let b = vaddq_s16(y_i16, vshrq_n_s16::<7>(vmulq_s16(u_i16, c_227)));
-
-            let r_u8 = vqmovun_s16(r);
-            let g_u8 = vqmovun_s16(g);
-            let b_u8 = vqmovun_s16(b);
-
-            let rgb = uint8x8x3_t(r_u8, g_u8, b_u8);
-            vst3_u8(rgb_row_ptr.add(col * 3), rgb);
-
-            col += 8;
-        }
-
-        // Scalar tail for remaining pixels
-        while col < width {
-            let y_val = *y_row_ptr.add(col) as i16;
-            let u_val = *u_row_ptr.add(col / 2) as i16 - 128;
-            let v_val = *v_row_ptr.add(col / 2) as i16 - 128;
-
-            let r = y_val + ((v_val * 179) >> 7);
-            let g = y_val - (((u_val * 44) + (v_val * 91)) >> 7);
-            let b = y_val + ((u_val * 227) >> 7);
-
-            let idx = col * 3;
-            *rgb_row_ptr.add(idx) = r.clamp(0, 255) as u8;
-            *rgb_row_ptr.add(idx + 1) = g.clamp(0, 255) as u8;
-            *rgb_row_ptr.add(idx + 2) = b.clamp(0, 255) as u8;
-
-            col += 1;
-        }
-    }
-}
-
-/// AVX2-accelerated YUV420→RGB8 conversion (x86_64).
-/// Processes 16 pixels per iteration using i16 fixed-point arithmetic.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
-unsafe fn yuv420_to_rgb8_rows_avx2(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    rgb_out: &mut [u8],
-    width: usize,
-    uv_stride: usize,
-    start_row: usize,
-    end_row: usize,
-) {
-    use std::arch::x86_64::*;
-
-    // BT.601 fixed-point Q7 constants
-    let c_179 = _mm256_set1_epi16(179);
-    let c_44 = _mm256_set1_epi16(44);
-    let c_91 = _mm256_set1_epi16(91);
-    let c_227 = _mm256_set1_epi16(227);
-    let c_128 = _mm256_set1_epi16(128);
-    let zero = _mm256_setzero_si256();
-
-    for row in start_row..end_row {
-        let out_row = row - start_row;
-        let y_row_ptr = y_plane.as_ptr().add(row * width);
-        let uv_row = (row / 2) * uv_stride;
-        let u_row_ptr = u_plane.as_ptr().add(uv_row);
-        let v_row_ptr = v_plane.as_ptr().add(uv_row);
-        let rgb_row_ptr = rgb_out.as_mut_ptr().add(out_row * width * 3);
-
-        let mut col = 0usize;
-
-        // Process 16 pixels per iteration (16 Y, 8 U, 8 V)
-        while col + 16 <= width {
-            // Load 16 Y values into the low 128 bits, widen to i16 in 256 bits
-            let y16 = _mm_loadu_si128(y_row_ptr.add(col) as *const __m128i);
-            let y_lo = _mm256_cvtepu8_epi16(y16);
-
-            // Load 8 U/V values, duplicate each for 2 horizontal pixels → 16 values
-            let mut u_buf = [0u8; 16];
-            let mut v_buf = [0u8; 16];
-            for i in 0..8 {
-                u_buf[i * 2] = *u_row_ptr.add(col / 2 + i);
-                u_buf[i * 2 + 1] = *u_row_ptr.add(col / 2 + i);
-                v_buf[i * 2] = *v_row_ptr.add(col / 2 + i);
-                v_buf[i * 2 + 1] = *v_row_ptr.add(col / 2 + i);
-            }
-            let u16_raw = _mm_loadu_si128(u_buf.as_ptr() as *const __m128i);
-            let v16_raw = _mm_loadu_si128(v_buf.as_ptr() as *const __m128i);
-
-            let u_i16 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(u16_raw), c_128);
-            let v_i16 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(v16_raw), c_128);
-
-            // R = Y + (V * 179) >> 7
-            let r = _mm256_add_epi16(
-                y_lo,
-                _mm256_srai_epi16::<7>(_mm256_mullo_epi16(v_i16, c_179)),
-            );
-            // G = Y - ((U * 44 + V * 91) >> 7)
-            let g = _mm256_sub_epi16(
-                y_lo,
-                _mm256_srai_epi16::<7>(_mm256_add_epi16(
-                    _mm256_mullo_epi16(u_i16, c_44),
-                    _mm256_mullo_epi16(v_i16, c_91),
-                )),
-            );
-            // B = Y + (U * 227) >> 7
-            let b = _mm256_add_epi16(
-                y_lo,
-                _mm256_srai_epi16::<7>(_mm256_mullo_epi16(u_i16, c_227)),
-            );
-
-            // Saturating pack i16 → u8 (packus packs lanes independently, then
-            // vpermute corrects the cross-lane ordering)
-            let r_packed = _mm256_packus_epi16(r, zero);
-            let g_packed = _mm256_packus_epi16(g, zero);
-            let b_packed = _mm256_packus_epi16(b, zero);
-
-            // Extract lower 16 bytes (the valid u8 results) after fixing lane order
-            let r_perm = _mm256_permute4x64_epi64::<0xD8>(r_packed);
-            let g_perm = _mm256_permute4x64_epi64::<0xD8>(g_packed);
-            let b_perm = _mm256_permute4x64_epi64::<0xD8>(b_packed);
-
-            let r_lo128 = _mm256_castsi256_si128(r_perm);
-            let g_lo128 = _mm256_castsi256_si128(g_perm);
-            let b_lo128 = _mm256_castsi256_si128(b_perm);
-
-            // Interleave and store RGB (manual interleave since x86 has no vst3)
-            let mut r_arr = [0u8; 16];
-            let mut g_arr = [0u8; 16];
-            let mut b_arr = [0u8; 16];
-            _mm_storeu_si128(r_arr.as_mut_ptr() as *mut __m128i, r_lo128);
-            _mm_storeu_si128(g_arr.as_mut_ptr() as *mut __m128i, g_lo128);
-            _mm_storeu_si128(b_arr.as_mut_ptr() as *mut __m128i, b_lo128);
-
-            let mut rgb_buf = [0u8; 48];
-            for i in 0..16 {
-                rgb_buf[i * 3] = r_arr[i];
-                rgb_buf[i * 3 + 1] = g_arr[i];
-                rgb_buf[i * 3 + 2] = b_arr[i];
-            }
-            std::ptr::copy_nonoverlapping(rgb_buf.as_ptr(), rgb_row_ptr.add(col * 3), 48);
-
-            col += 16;
-        }
-
-        // Process 8 pixels using 128-bit subset
-        while col + 8 <= width {
-            let y8 = _mm_loadl_epi64(y_row_ptr.add(col) as *const __m128i);
-            let zero128 = _mm_setzero_si128();
-            let y_i16 = _mm_unpacklo_epi8(y8, zero128);
-
-            let c_179_128 = _mm_set1_epi16(179);
-            let c_44_128 = _mm_set1_epi16(44);
-            let c_91_128 = _mm_set1_epi16(91);
-            let c_227_128 = _mm_set1_epi16(227);
-            let c_128_128 = _mm_set1_epi16(128);
-
-            let mut u_buf = [0u8; 8];
-            let mut v_buf = [0u8; 8];
-            for i in 0..4 {
-                u_buf[i * 2] = *u_row_ptr.add(col / 2 + i);
-                u_buf[i * 2 + 1] = *u_row_ptr.add(col / 2 + i);
-                v_buf[i * 2] = *v_row_ptr.add(col / 2 + i);
-                v_buf[i * 2 + 1] = *v_row_ptr.add(col / 2 + i);
-            }
-            let u8_dup = _mm_loadl_epi64(u_buf.as_ptr() as *const __m128i);
-            let v8_dup = _mm_loadl_epi64(v_buf.as_ptr() as *const __m128i);
-
-            let u_i16 = _mm_sub_epi16(_mm_unpacklo_epi8(u8_dup, zero128), c_128_128);
-            let v_i16 = _mm_sub_epi16(_mm_unpacklo_epi8(v8_dup, zero128), c_128_128);
-
-            let r = _mm_add_epi16(
-                y_i16,
-                _mm_srai_epi16::<7>(_mm_mullo_epi16(v_i16, c_179_128)),
-            );
-            let g = _mm_sub_epi16(
-                y_i16,
-                _mm_srai_epi16::<7>(_mm_add_epi16(
-                    _mm_mullo_epi16(u_i16, c_44_128),
-                    _mm_mullo_epi16(v_i16, c_91_128),
-                )),
-            );
-            let b = _mm_add_epi16(
-                y_i16,
-                _mm_srai_epi16::<7>(_mm_mullo_epi16(u_i16, c_227_128)),
-            );
-
-            let r_u8 = _mm_packus_epi16(r, zero128);
-            let g_u8 = _mm_packus_epi16(g, zero128);
-            let b_u8 = _mm_packus_epi16(b, zero128);
-
-            let mut r_arr = [0u8; 8];
-            let mut g_arr = [0u8; 8];
-            let mut b_arr = [0u8; 8];
-            _mm_storel_epi64(r_arr.as_mut_ptr() as *mut __m128i, r_u8);
-            _mm_storel_epi64(g_arr.as_mut_ptr() as *mut __m128i, g_u8);
-            _mm_storel_epi64(b_arr.as_mut_ptr() as *mut __m128i, b_u8);
-
-            let mut rgb_buf = [0u8; 24];
-            for i in 0..8 {
-                rgb_buf[i * 3] = r_arr[i];
-                rgb_buf[i * 3 + 1] = g_arr[i];
-                rgb_buf[i * 3 + 2] = b_arr[i];
-            }
-            std::ptr::copy_nonoverlapping(rgb_buf.as_ptr(), rgb_row_ptr.add(col * 3), 24);
-
-            col += 8;
-        }
-
-        // Scalar tail
-        while col < width {
-            let y_val = *y_row_ptr.add(col) as i16;
-            let u_val = *u_row_ptr.add(col / 2) as i16 - 128;
-            let v_val = *v_row_ptr.add(col / 2) as i16 - 128;
-
-            let r = y_val + ((v_val * 179) >> 7);
-            let g = y_val - (((u_val * 44) + (v_val * 91)) >> 7);
-            let b = y_val + ((u_val * 227) >> 7);
-
-            let idx = col * 3;
-            *rgb_row_ptr.add(idx) = r.clamp(0, 255) as u8;
-            *rgb_row_ptr.add(idx + 1) = g.clamp(0, 255) as u8;
-            *rgb_row_ptr.add(idx + 2) = b.clamp(0, 255) as u8;
-
-            col += 1;
-        }
-    }
-}
-
-/// SSE2-accelerated YUV420→RGB8 conversion (x86_64).
-/// Processes 8 pixels per iteration using i16 fixed-point arithmetic.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
-unsafe fn yuv420_to_rgb8_rows_sse2(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    rgb_out: &mut [u8],
-    width: usize,
-    uv_stride: usize,
-    start_row: usize,
-    end_row: usize,
-) {
-    use std::arch::x86_64::*;
-
-    // BT.601 fixed-point Q7 constants (fit in i16 without overflow)
-    let c_179 = _mm_set1_epi16(179); // 1.402 * 128
-    let c_44 = _mm_set1_epi16(44); // 0.344 * 128
-    let c_91 = _mm_set1_epi16(91); // 0.714 * 128
-    let c_227 = _mm_set1_epi16(227); // 1.772 * 128
-    let c_128 = _mm_set1_epi16(128);
-    let zero = _mm_setzero_si128();
-
-    for row in start_row..end_row {
-        let out_row = row - start_row;
-        let y_row_ptr = y_plane.as_ptr().add(row * width);
-        let uv_row = (row / 2) * uv_stride;
-        let u_row_ptr = u_plane.as_ptr().add(uv_row);
-        let v_row_ptr = v_plane.as_ptr().add(uv_row);
-        let rgb_row_ptr = rgb_out.as_mut_ptr().add(out_row * width * 3);
-
-        let mut col = 0usize;
-
-        // Process 8 pixels per iteration
-        while col + 8 <= width {
-            // Load 8 Y values, widen to i16
-            let y8 = _mm_loadl_epi64(y_row_ptr.add(col) as *const __m128i);
-            let y_i16 = _mm_unpacklo_epi8(y8, zero);
-
-            // Load 4 U/V values, duplicate each for 2 horizontal pixels
-            let mut u_buf = [0u8; 8];
-            let mut v_buf = [0u8; 8];
-            for i in 0..4 {
-                u_buf[i * 2] = *u_row_ptr.add(col / 2 + i);
-                u_buf[i * 2 + 1] = *u_row_ptr.add(col / 2 + i);
-                v_buf[i * 2] = *v_row_ptr.add(col / 2 + i);
-                v_buf[i * 2 + 1] = *v_row_ptr.add(col / 2 + i);
-            }
-            let u8_dup = _mm_loadl_epi64(u_buf.as_ptr() as *const __m128i);
-            let v8_dup = _mm_loadl_epi64(v_buf.as_ptr() as *const __m128i);
-
-            let u_i16 = _mm_sub_epi16(_mm_unpacklo_epi8(u8_dup, zero), c_128);
-            let v_i16 = _mm_sub_epi16(_mm_unpacklo_epi8(v8_dup, zero), c_128);
-
-            // R = Y + (V * 359) >> 8
-            let r = _mm_add_epi16(y_i16, _mm_srai_epi16::<7>(_mm_mullo_epi16(v_i16, c_179)));
-            // G = Y - ((U * 44 + V * 91) >> 7)
-            let g = _mm_sub_epi16(
-                y_i16,
-                _mm_srai_epi16::<7>(_mm_add_epi16(
-                    _mm_mullo_epi16(u_i16, c_44),
-                    _mm_mullo_epi16(v_i16, c_91),
-                )),
-            );
-            // B = Y + (U * 227) >> 7
-            let b = _mm_add_epi16(y_i16, _mm_srai_epi16::<7>(_mm_mullo_epi16(u_i16, c_227)));
-
-            // Saturating pack i16 → u8
-            let r_u8 = _mm_packus_epi16(r, zero); // low 8 bytes valid
-            let g_u8 = _mm_packus_epi16(g, zero);
-            let b_u8 = _mm_packus_epi16(b, zero);
-
-            // Interleave and store RGB (no vst3 on SSE, do it manually)
-            let mut rgb_buf = [0u8; 24];
-            let mut r_arr = [0u8; 8];
-            let mut g_arr = [0u8; 8];
-            let mut b_arr = [0u8; 8];
-            _mm_storel_epi64(r_arr.as_mut_ptr() as *mut __m128i, r_u8);
-            _mm_storel_epi64(g_arr.as_mut_ptr() as *mut __m128i, g_u8);
-            _mm_storel_epi64(b_arr.as_mut_ptr() as *mut __m128i, b_u8);
-            for i in 0..8 {
-                rgb_buf[i * 3] = r_arr[i];
-                rgb_buf[i * 3 + 1] = g_arr[i];
-                rgb_buf[i * 3 + 2] = b_arr[i];
-            }
-            std::ptr::copy_nonoverlapping(rgb_buf.as_ptr(), rgb_row_ptr.add(col * 3), 24);
-
-            col += 8;
-        }
-
-        // Scalar tail
-        while col < width {
-            let y_val = *y_row_ptr.add(col) as i16;
-            let u_val = *u_row_ptr.add(col / 2) as i16 - 128;
-            let v_val = *v_row_ptr.add(col / 2) as i16 - 128;
-
-            let r = y_val + ((v_val * 179) >> 7);
-            let g = y_val - (((u_val * 44) + (v_val * 91)) >> 7);
-            let b = y_val + ((u_val * 227) >> 7);
-
-            let idx = col * 3;
-            *rgb_row_ptr.add(idx) = r.clamp(0, 255) as u8;
-            *rgb_row_ptr.add(idx + 1) = g.clamp(0, 255) as u8;
-            *rgb_row_ptr.add(idx + 2) = b.clamp(0, 255) as u8;
-
-            col += 1;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// H.265 (HEVC) NAL unit types
-// ---------------------------------------------------------------------------
-
-/// HEVC NAL unit types (ITU-T H.265).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HevcNalUnitType {
-    TrailN,
-    TrailR,
-    TsaN,
-    TsaR,
-    StsaN,
-    StsaR,
-    RadlN,
-    RadlR,
-    RaslN,
-    RaslR,
-    BlaWLp,
-    BlaWRadl,
-    BlaNLp,
-    IdrWRadl,
-    IdrNLp,
-    CraNut,
-    VpsNut,
-    SpsNut,
-    PpsNut,
-    AudNut,
-    EosNut,
-    EobNut,
-    FdNut,
-    PrefixSeiNut,
-    SuffixSeiNut,
-    Other(u8),
-}
-
-impl HevcNalUnitType {
-    /// Parses the HEVC NAL unit type from the first two header bytes.
-    ///
-    /// HEVC uses a 2-byte NAL header: `forbidden_zero_bit(1) | nal_unit_type(6) | nuh_layer_id(6) | nuh_temporal_id_plus1(3)`.
-    pub fn from_header(header: &[u8]) -> Self {
-        if header.is_empty() {
-            return Self::Other(0);
-        }
-        let nal_type = (header[0] >> 1) & 0x3F;
-        Self::from_type_byte(nal_type)
-    }
-
-    fn from_type_byte(t: u8) -> Self {
-        match t {
-            0 => Self::TrailN,
-            1 => Self::TrailR,
-            2 => Self::TsaN,
-            3 => Self::TsaR,
-            4 => Self::StsaN,
-            5 => Self::StsaR,
-            6 => Self::RadlN,
-            7 => Self::RadlR,
-            8 => Self::RaslN,
-            9 => Self::RaslR,
-            16 => Self::BlaWLp,
-            17 => Self::BlaWRadl,
-            18 => Self::BlaNLp,
-            19 => Self::IdrWRadl,
-            20 => Self::IdrNLp,
-            21 => Self::CraNut,
-            32 => Self::VpsNut,
-            33 => Self::SpsNut,
-            34 => Self::PpsNut,
-            35 => Self::AudNut,
-            36 => Self::EosNut,
-            37 => Self::EobNut,
-            38 => Self::FdNut,
-            39 => Self::PrefixSeiNut,
-            40 => Self::SuffixSeiNut,
-            other => Self::Other(other),
-        }
-    }
-
-    /// Returns true for VCL (Video Coding Layer) NAL unit types.
-    pub fn is_vcl(&self) -> bool {
-        matches!(
-            self,
-            Self::TrailN
-                | Self::TrailR
-                | Self::TsaN
-                | Self::TsaR
-                | Self::StsaN
-                | Self::StsaR
-                | Self::RadlN
-                | Self::RadlR
-                | Self::RaslN
-                | Self::RaslR
-                | Self::BlaWLp
-                | Self::BlaWRadl
-                | Self::BlaNLp
-                | Self::IdrWRadl
-                | Self::IdrNLp
-                | Self::CraNut
-        )
-    }
-
-    /// Returns true for IDR (instantaneous decoder refresh) types.
-    pub fn is_idr(&self) -> bool {
-        matches!(self, Self::IdrWRadl | Self::IdrNLp)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{HevcNalUnitType, yuv420_to_rgb8};
 
     #[test]
     fn bitstream_reader_reads_bits() {
@@ -3142,6 +1657,16 @@ mod tests {
         push_bits(&mut pps_bits, 0, 2);
         // pic_init_qp_minus26 = se(0)
         push_signed_exp_golomb(&mut pps_bits, 0);
+        // pic_init_qs_minus26 = se(0)
+        push_signed_exp_golomb(&mut pps_bits, 0);
+        // chroma_qp_index_offset = se(0)
+        push_signed_exp_golomb(&mut pps_bits, 0);
+        // deblocking_filter_control_present_flag = 0
+        push_bits(&mut pps_bits, 0, 1);
+        // constrained_intra_pred_flag = 0
+        push_bits(&mut pps_bits, 0, 1);
+        // redundant_pic_cnt_present_flag = 0
+        push_bits(&mut pps_bits, 0, 1);
 
         let pps_bytes = bits_to_bytes(&pps_bits);
         bitstream.push(0x68); // NAL header for PPS

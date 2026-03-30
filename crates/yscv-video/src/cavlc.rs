@@ -33,15 +33,41 @@ impl<'a> BitReader<'a> {
         (self.data.len() - self.byte_pos) * 8 - self.bit_pos as usize
     }
 
-    /// Reads `n` bits (1..=32) as a `u32`, MSB first. Returns `None` on
-    /// exhaustion.
+    /// Reads `n` bits (1..=32) as a `u32`, MSB first. Returns `None` on exhaustion.
     pub fn read_bits(&mut self, n: u8) -> Option<u32> {
-        debug_assert!((1..=32).contains(&n));
+        if n == 0 {
+            return Some(0);
+        }
         if self.bits_remaining() < n as usize {
             return None;
         }
         let mut value = 0u32;
-        for _ in 0..n {
+        let mut remaining = n;
+
+        // Fast path: consume partial byte
+        if self.bit_pos > 0 && self.byte_pos < self.data.len() {
+            let avail = 8 - self.bit_pos;
+            let take = remaining.min(avail);
+            let shift = avail - take;
+            let mask = (1u8 << take) - 1;
+            value = ((self.data[self.byte_pos] >> shift) & mask) as u32;
+            self.bit_pos += take;
+            if self.bit_pos >= 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
+            }
+            remaining -= take;
+        }
+
+        // Fast path: full bytes
+        while remaining >= 8 && self.byte_pos < self.data.len() {
+            value = (value << 8) | self.data[self.byte_pos] as u32;
+            self.byte_pos += 1;
+            remaining -= 8;
+        }
+
+        // Remainder
+        while remaining > 0 && self.byte_pos < self.data.len() {
             let bit = (self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1;
             value = (value << 1) | bit as u32;
             self.bit_pos += 1;
@@ -49,8 +75,26 @@ impl<'a> BitReader<'a> {
                 self.bit_pos = 0;
                 self.byte_pos += 1;
             }
+            remaining -= 1;
         }
         Some(value)
+    }
+
+    /// Peek at the next `n` bits without consuming them.
+    pub fn peek_bits(&self, n: u8) -> Option<u32> {
+        let mut tmp = BitReader {
+            data: self.data,
+            byte_pos: self.byte_pos,
+            bit_pos: self.bit_pos,
+        };
+        tmp.read_bits(n)
+    }
+
+    /// Consume (skip) `n` bits.
+    pub fn consume(&mut self, n: u8) {
+        let total = self.byte_pos * 8 + self.bit_pos as usize + n as usize;
+        self.byte_pos = total / 8;
+        self.bit_pos = (total % 8) as u8;
     }
 
     /// Reads an unsigned Exp-Golomb coded integer (ue(v)).
@@ -90,18 +134,19 @@ impl<'a> BitReader<'a> {
 // ---------------------------------------------------------------------------
 
 /// Decoded CAVLC residual coefficients for one block.
+/// Uses fixed-size arrays (max 16 coefficients) to avoid heap allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CavlcResult {
     /// Number of non-zero coefficients (0..=16).
     pub total_coeffs: usize,
     /// Number of trailing +/-1 coefficients (0..=3).
     pub trailing_ones: usize,
-    /// Non-zero coefficient levels in reverse scan order.
-    pub levels: Vec<i32>,
+    /// Non-zero coefficient levels in reverse scan order (first `total_coeffs` valid).
+    pub levels: [i32; 16],
     /// Total number of zero-valued coefficients before the last non-zero.
     pub total_zeros: usize,
-    /// Run of zeros before each coefficient (reverse scan order).
-    pub runs: Vec<usize>,
+    /// Run of zeros before each coefficient (first `total_coeffs` valid).
+    pub runs: [usize; 16],
 }
 
 // coeff_token VLC tables — each entry is (bit_pattern, bit_length, total_coeffs, trailing_ones).
@@ -217,29 +262,24 @@ fn read_coeff_token(reader: &mut BitReader, nc: i32) -> Option<(u8, u8)> {
 
     let table = select_coeff_token_table(nc);
 
-    // Try matching longest-prefix: peek up to 16 bits and check each entry.
-    // We need to save/restore position for mismatches.
-    let save_byte = reader.byte_pos;
-    let save_bit = reader.bit_pos;
-    let avail = reader.bits_remaining();
+    // Peek once, match all entries against peeked bits
+    let max_len = table.iter().map(|e| e.length).max().unwrap_or(1);
+    let avail = reader.bits_remaining() as u8;
+    let peek_len = max_len.min(avail);
+    let peeked = reader.peek_bits(peek_len)?;
 
     for entry in table {
         let len = entry.length;
-        if (len as usize) > avail {
+        if len > peek_len {
             continue;
         }
-        // Restore position for each attempt.
-        reader.byte_pos = save_byte;
-        reader.bit_pos = save_bit;
-        let bits = reader.read_bits(len)?;
-        if bits == entry.pattern {
+        let shift = peek_len - len;
+        let masked = peeked >> shift;
+        if masked == entry.pattern {
+            reader.consume(len);
             return Some((entry.total_coeffs, entry.trailing_ones));
         }
     }
-
-    // No match found — restore position and return None.
-    reader.byte_pos = save_byte;
-    reader.bit_pos = save_bit;
     None
 }
 
@@ -346,25 +386,27 @@ fn total_zeros_table(total_coeffs: usize) -> &'static [VlcEntry] {
 
 /// Reads a value from a VLC table by trying each entry.
 fn read_vlc(reader: &mut BitReader, table: &[VlcEntry]) -> Option<u8> {
-    let save_byte = reader.byte_pos;
-    let save_bit = reader.bit_pos;
-    let avail = reader.bits_remaining();
+    // Find max code length in table
+    let max_len = table.iter().map(|e| e.length).max().unwrap_or(1);
+    let avail = reader.bits_remaining() as u8;
+    let peek_len = max_len.min(avail);
+
+    // Peek once, then match all entries against the peeked bits
+    let peeked = reader.peek_bits(peek_len)?;
 
     for entry in table {
         let len = entry.length;
-        if (len as usize) > avail {
+        if len > peek_len {
             continue;
         }
-        reader.byte_pos = save_byte;
-        reader.bit_pos = save_bit;
-        let bits = reader.read_bits(len)?;
-        if bits == entry.pattern {
+        // Extract the top `len` bits from peeked value
+        let shift = peek_len - len;
+        let masked = peeked >> shift;
+        if masked == entry.pattern {
+            reader.consume(len);
             return Some(entry.value);
         }
     }
-
-    reader.byte_pos = save_byte;
-    reader.bit_pos = save_bit;
     None
 }
 
@@ -485,18 +527,22 @@ pub fn decode_cavlc_block(reader: &mut BitReader, nc: i32) -> Option<CavlcResult
         return Some(CavlcResult {
             total_coeffs: 0,
             trailing_ones: 0,
-            levels: Vec::new(),
+            levels: [0; 16],
             total_zeros: 0,
-            runs: Vec::new(),
+            runs: [0; 16],
         });
     }
 
-    let mut levels = Vec::with_capacity(total_coeffs);
+    let mut levels = [0i32; 16];
+    let mut level_count = 0usize;
 
     // Step (b): read sign of trailing ones (1 bit each, in reverse order)
     for _ in 0..trailing_ones {
         let sign_bit = reader.read_bits(1)?;
-        levels.push(if sign_bit == 0 { 1 } else { -1 });
+        if level_count < 16 {
+            levels[level_count] = if sign_bit == 0 { 1 } else { -1 };
+            level_count += 1;
+        }
     }
 
     // Step (c): read remaining levels (from trailing_ones..total_coeffs)
@@ -548,7 +594,10 @@ pub fn decode_cavlc_block(reader: &mut BitReader, nc: i32) -> Option<CavlcResult
             (-level_code - 1) >> 1
         };
 
-        levels.push(level);
+        if level_count < 16 {
+            levels[level_count] = level;
+            level_count += 1;
+        }
 
         // Update suffix_length based on decoded level magnitude.
         if suffix_length == 0 {
@@ -574,7 +623,7 @@ pub fn decode_cavlc_block(reader: &mut BitReader, nc: i32) -> Option<CavlcResult
     };
 
     // Step (e): read run_before for each coefficient.
-    let mut runs = vec![0usize; total_coeffs];
+    let mut runs = [0usize; 16];
     let mut zeros_left = total_zeros;
     for i in 0..total_coeffs - 1 {
         if zeros_left == 0 {
@@ -610,35 +659,39 @@ pub fn decode_cavlc_block(reader: &mut BitReader, nc: i32) -> Option<CavlcResult
 /// order (DC first) and inserts the decoded zero runs.
 pub fn expand_cavlc_to_coefficients(result: &CavlcResult, block_size: usize) -> Vec<i32> {
     let mut coeffs = vec![0i32; block_size];
+    expand_cavlc_to_coefficients_into(result, &mut coeffs);
+    coeffs
+}
 
+/// Zero-allocation version: writes coefficients into a pre-allocated slice.
+/// Slice must be zeroed before calling.
+pub fn expand_cavlc_to_coefficients_into(result: &CavlcResult, coeffs: &mut [i32]) {
     if result.total_coeffs == 0 {
-        return coeffs;
+        return;
     }
 
-    // Walk the levels in reverse (they are stored highest-frequency-first)
-    // and place them with their run-before gaps.
     let n = result.total_coeffs;
+    let block_size = coeffs.len();
     let mut pos = block_size;
 
     for i in 0..n {
-        // Number of zeros before this coefficient (in reverse scan).
-        let run = result.runs[i];
-
-        // Reserve space for the run of zeros.
+        let run = if i < result.runs.len() {
+            result.runs[i]
+        } else {
+            0
+        };
         if pos < run {
             break;
         }
         pos -= run;
-
-        // Place the coefficient.
         if pos == 0 {
             break;
         }
         pos -= 1;
-        coeffs[pos] = result.levels[n - 1 - i];
+        if n > i && (n - 1 - i) < result.levels.len() {
+            coeffs[pos] = result.levels[n - 1 - i];
+        }
     }
-
-    coeffs
 }
 
 // ---------------------------------------------------------------------------
@@ -720,9 +773,9 @@ mod tests {
         let result = decode_cavlc_block(&mut r, 0).unwrap();
         assert_eq!(result.total_coeffs, 0);
         assert_eq!(result.trailing_ones, 0);
-        assert!(result.levels.is_empty());
+        assert_eq!(result.levels, [0; 16]);
         assert_eq!(result.total_zeros, 0);
-        assert!(result.runs.is_empty());
+        assert_eq!(result.runs, [0; 16]);
     }
 
     #[test]
@@ -731,9 +784,21 @@ mod tests {
         let result = CavlcResult {
             total_coeffs: 3,
             trailing_ones: 0,
-            levels: vec![5, -3, 2], // reverse scan: highest freq first
+            levels: {
+                let mut l = [0i32; 16];
+                l[0] = 5;
+                l[1] = -3;
+                l[2] = 2;
+                l
+            },
             total_zeros: 2,
-            runs: vec![1, 0, 1], // run before each coeff (reverse scan order)
+            runs: {
+                let mut r = [0usize; 16];
+                r[0] = 1;
+                r[1] = 0;
+                r[2] = 1;
+                r
+            },
         };
 
         let coeffs = expand_cavlc_to_coefficients(&result, 8);
@@ -765,9 +830,9 @@ mod tests {
         let result = CavlcResult {
             total_coeffs: 0,
             trailing_ones: 0,
-            levels: Vec::new(),
+            levels: [0; 16],
             total_zeros: 0,
-            runs: Vec::new(),
+            runs: [0; 16],
         };
         let coeffs = expand_cavlc_to_coefficients(&result, 16);
         assert_eq!(coeffs, vec![0; 16]);
